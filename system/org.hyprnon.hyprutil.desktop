@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=hypr-util
+Comment=Fan curve and keyboard RGB control
+Exec=%REPO_DIR%/bin/hyprutil app
+Icon=org.hyprnon.hyprutil-v2
+Terminal=false
+Categories=Settings;HardwareSettings;
+StartupWMClass=org.hyprnon.hyprutil

@@ -1,0 +1,18 @@
+// Passwordless polkit rule scoped to exactly two binary paths: lets Focus
+// mode's site/IP blocking toggle without an interactive password prompt on
+// every toggle. Narrowly targeted (exact program paths + exact action id)
+// rather than granting anything broader -- pkexec still fully mediates the
+// call, this just skips the auth dialog for these two helpers.
+//
+// Installed to /etc/polkit-1/rules.d/ by setup.sh
+// (install_focus_blocking_helpers); polkit re-reads that directory on its
+// own, no reload/restart needed.
+polkit.addRule(function(action, subject) {
+	var program = action.lookup("program");
+	if (action.id == "org.freedesktop.policykit.exec" &&
+	    (program == "/usr/local/bin/hypr-util-focus-hosts" ||
+	     program == "/usr/local/bin/hypr-util-focus-fw") &&
+	    subject.isInGroup("wheel")) {
+		return polkit.Result.YES;
+	}
+});

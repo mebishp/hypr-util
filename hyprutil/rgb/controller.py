@@ -1,5 +1,5 @@
 """Keyboard RGB device control, backed by the firefly-ctl binary (see
-~/hypr-util/firefly-ctl).
+firefly-ctl/ next to this repo's root).
 
 That binary has CAP_SYS_ADMIN granted via setcap, which raw USB control on
 this device needs (detaching the kernel HID driver). Shelling out to it keeps
@@ -7,13 +7,28 @@ that privilege scoped to one narrow, single-purpose executable instead of
 needing capability tricks around a general-purpose Python interpreter.
 """
 import colorsys
+import logging
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 from . import watch
 
-CTL_BIN = Path.home() / "hypr-util" / "firefly-ctl" / "target" / "debug" / "firefly-ctl"
+logger = logging.getLogger(__name__)
+
+# Serializes every apply() call across threads in this process (flash,
+# revert, manual preset apply, resume/reconnect restore, ...). Without it,
+# two concurrent calls -- e.g. an older flash's revert racing a brand new
+# profile-change flash that starts a moment later -- can have their two
+# firefly-ctl invocations (each itself sending header+color+effects, twice)
+# land on the wire in an interleaved order, leaving the device in a
+# "Frankenstein" state such as one call's effect combined with the other
+# call's color, which nothing afterward ever corrects.
+_device_lock = threading.Lock()
+
+REPO_DIR = Path(__file__).resolve().parents[2]
+CTL_BIN = REPO_DIR / "firefly-ctl" / "target" / "debug" / "firefly-ctl"
 DEFAULT_BRIGHTNESS = 5  # the device's own default of 1 renders washed out
 
 EFFECTS = [
@@ -32,7 +47,7 @@ def _on_watcher_change(connected):
         try:
             cb(connected)
         except Exception:
-            pass
+            logger.exception("connection-change listener %r failed", cb)
 
 
 def _ensure_watcher():
@@ -99,9 +114,10 @@ def apply(effect, colors, color_idx=7, brightness=DEFAULT_BRIGHTNESS):
         "--brightness", str(brightness),
         "--colors", ",".join(colors),
     ]
-    # The device occasionally drops the effect switch mid-transition (e.g.
-    # going from a multi-color animation to a different static color); a
-    # second send a moment later reliably settles it.
-    subprocess.run(cmd, check=True, capture_output=True, timeout=5)
-    time.sleep(0.15)
-    subprocess.run(cmd, check=True, capture_output=True, timeout=5)
+    with _device_lock:
+        # The device occasionally drops the effect switch mid-transition
+        # (e.g. going from a multi-color animation to a different static
+        # color); a second send a moment later reliably settles it.
+        subprocess.run(cmd, check=True, capture_output=True, timeout=5)
+        time.sleep(0.15)
+        subprocess.run(cmd, check=True, capture_output=True, timeout=5)

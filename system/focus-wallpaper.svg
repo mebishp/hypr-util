@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080">
+  <!-- Focus-mode wallpaper (light variant): text-only by design, so it
+       reads as a deliberate interruption rather than just another picture.
+       Installed to ~/.local/share/hypr-util/focus-wallpaper.svg by setup.sh
+       (install_focus_wallpaper) and applied via
+       org.gnome.desktop.background picture-uri while focus mode is active
+       (see hyprutil/focus.py's set_wallpaper / automation.py's
+       FocusController). -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#eef1f6"/>
+      <stop offset="100%" stop-color="#dfe4ee"/>
+    </linearGradient>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#bg)"/>
+  <text x="960" y="500" text-anchor="middle"
+        font-family="sans-serif" font-weight="800" font-size="180"
+        letter-spacing="4" fill="#10162c">FOCUS.</text>
+  <text x="960" y="590" text-anchor="middle"
+        font-family="sans-serif" font-weight="500" font-size="42"
+        letter-spacing="10" fill="#3a4468">ONE THING AT A TIME</text>
+  <rect x="860" y="650" width="200" height="6" rx="3" fill="#3355ff"/>
+</svg>

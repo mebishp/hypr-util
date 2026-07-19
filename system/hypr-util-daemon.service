@@ -1,0 +1,21 @@
+[Unit]
+Description=hypr-util automation daemon (display refresh rate + RGB reaction to power profile, RGB restore on resume, restore on sleep)
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%REPO_DIR%/bin/hyprutil daemon
+# Belt-and-suspenders teardown for Focus mode's site/IP blocks: normally
+# FocusController._exit() clears them, but if this daemon is killed/crashes
+# mid-session there's no running process left to do that, and the /etc/hosts
+# block would otherwise survive indefinitely (even across reboot). Runs
+# unconditionally on every stop (including a plain restart) -- both helpers'
+# "off" is idempotent/cheap, and the daemon re-applies the blocklist on its
+# own next start if focus.json still says active (see FocusController.start).
+ExecStopPost=/usr/bin/pkexec /usr/local/bin/hypr-util-focus-hosts off
+ExecStopPost=/usr/bin/pkexec /usr/local/bin/hypr-util-focus-fw off
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

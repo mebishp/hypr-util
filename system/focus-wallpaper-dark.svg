@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1920 1080" width="1920" height="1080">
+  <!-- Focus-mode wallpaper (dark variant): see focus-wallpaper.svg for
+       the full rationale. Applied via picture-uri-dark under GNOME's dark
+       theme. Uses the same blue as the keyboard's focus-mode breathe
+       (rgb/notify.py's FOCUS_FLASH_COLOR, 0000ff) as the one accent color,
+       so the whole focus-mode "moment" (wallpaper swap + breathe) reads as
+       one consistent signal. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#0a0d16"/>
+      <stop offset="100%" stop-color="#12172a"/>
+    </linearGradient>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#bg)"/>
+  <text x="960" y="500" text-anchor="middle"
+        font-family="sans-serif" font-weight="800" font-size="180"
+        letter-spacing="4" fill="#f2f4fb">FOCUS.</text>
+  <text x="960" y="590" text-anchor="middle"
+        font-family="sans-serif" font-weight="500" font-size="42"
+        letter-spacing="10" fill="#8a93c0">ONE THING AT A TIME</text>
+  <rect x="860" y="650" width="200" height="6" rx="3" fill="#3d6bff"/>
+</svg>

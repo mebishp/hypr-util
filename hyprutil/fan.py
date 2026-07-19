@@ -2,7 +2,10 @@
 import subprocess
 from pathlib import Path
 
-CONFIG_DIR = Path.home() / ".config" / "hypr-util"
+from .util import CONFIG_DIR, atomic_write_text
+
+SUBPROCESS_TIMEOUT = 3
+
 CURVES_DIR = CONFIG_DIR / "curves"
 OVERRIDE_FILE = CONFIG_DIR / "override"
 SERVICE = "fancurve.service"
@@ -70,7 +73,7 @@ def read_curve(profile):
 def write_curve(profile, points):
     CURVES_DIR.mkdir(parents=True, exist_ok=True)
     lines = [f"{t} {p}" for t, p in sorted(points)]
-    curve_path(profile).write_text("\n".join(lines) + "\n")
+    atomic_write_text(curve_path(profile), "\n".join(lines) + "\n")
 
 
 def read_override():
@@ -81,20 +84,33 @@ def read_override():
 
 def write_override(value):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    OVERRIDE_FILE.write_text(f"{value}\n")
+    atomic_write_text(OVERRIDE_FILE, f"{value}\n")
 
 
 def current_power_profile():
-    r = subprocess.run(["powerprofilesctl", "get"], capture_output=True, text=True)
+    try:
+        r = subprocess.run(
+            ["powerprofilesctl", "get"], capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "balanced"
     return r.stdout.strip() or "balanced"
 
 
 def set_power_profile(profile):
-    subprocess.run(["powerprofilesctl", "set", profile])
+    try:
+        subprocess.run(["powerprofilesctl", "set", profile], timeout=SUBPROCESS_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        pass
 
 
 def service_active():
-    r = subprocess.run(["systemctl", "is-active", SERVICE], capture_output=True, text=True)
+    try:
+        r = subprocess.run(
+            ["systemctl", "is-active", SERVICE], capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
     return r.stdout.strip() == "active"
 
 

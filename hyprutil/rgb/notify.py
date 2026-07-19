@@ -15,11 +15,15 @@ PROFILE_FLASH_COLORS = {
 }
 
 
-def flash(effect, color, duration=3.5, color_idx=7, brightness=controller.DEFAULT_BRIGHTNESS):
+def flash(effect, color, duration=3.5, color_idx=7, brightness=controller.DEFAULT_BRIGHTNESS, revert=None):
     """Apply effect/color immediately, wait duration seconds, then revert to
     whichever preset was last active (no-op if none is known yet). Blocks
     for the full duration -- call this from a background thread in any UI
     context.
+
+    `revert`, if given, is called just before reverting; skip the revert if
+    it returns False (used to stop an overtaken flash from a rapid double
+    profile switch from stomping the newer flash's colors).
 
     Defaults (breathe, color_idx=7, 3.5s) were picked by hand via
     test_flash.py: "static"/color_idx=0 with "breathe" renders a fixed
@@ -28,7 +32,8 @@ def flash(effect, color, duration=3.5, color_idx=7, brightness=controller.DEFAUL
     colors = [color] * 7
     controller.apply(effect, colors, color_idx, brightness)
     time.sleep(duration)
-    _revert()
+    if revert is None or revert():
+        _revert()
 
 
 def _revert():
@@ -37,6 +42,16 @@ def _revert():
         presets.apply_preset(slot)
 
 
-def flash_for_profile(profile, effect="breathe", duration=3.5):
+def flash_for_profile(profile, effect="breathe", duration=3.5, revert=None):
     color = PROFILE_FLASH_COLORS.get(profile, "ffffff")
-    flash(effect, color, duration)
+    flash(effect, color, duration, revert=revert)
+
+
+# Same blue for both entering and exiting focus mode -- unlike profile
+# flashes there's no need to distinguish "which state", just "focus mode
+# changed", so one color covers both transitions.
+FOCUS_FLASH_COLOR = "0000ff"
+
+
+def flash_for_focus(effect="breathe", duration=3.5, revert=None):
+    flash(effect, FOCUS_FLASH_COLOR, duration, revert=revert)

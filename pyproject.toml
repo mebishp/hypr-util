@@ -1,0 +1,19 @@
+[project]
+name = "hypr-util"
+version = "0.1.0"
+description = "Fan curve and keyboard RGB control for this HP Omen laptop."
+requires-python = ">=3.11"
+
+# Runtime deps (PyGObject, PyQt6, pyudev) are intentionally not listed here --
+# they come from distro packages (see setup.sh), not pip, since gi/PyQt6 need
+# to match the system GTK/Qt install.
+
+[project.scripts]
+hyprutil = "hyprutil.cli:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["hyprutil*"]

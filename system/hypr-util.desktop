@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=hypr-util
+Comment=Fan curve and keyboard RGB tray controller
+Exec=%REPO_DIR%/bin/hyprutil tray
+Icon=org.hyprnon.hyprutil-v2
+Terminal=false
+X-GNOME-Autostart-enabled=true
