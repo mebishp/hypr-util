@@ -1,8 +1,8 @@
 # hypr-util
 
-<img src="system/icons/hicolor/scalable/apps/org.hyprnon.hyprutil-v2.svg" width="96" height="96" alt="hypr-util icon">
+<img src="system/icons/hicolor/scalable/apps/org.hyprnon.hyprutil-v2.svg" width="106" height="106" alt="hypr-util icon">
 
-Fan curve and keyboard RGB control for this HP Omen laptop.
+Fan curve and keyboard RGB control for HP Omen laptop and Cosmic Byte Firefly
 
 ## Parts
 
@@ -23,4 +23,3 @@ Installs missing packages, builds `firefly-ctl`, and installs the udev rule, sys
 
 https://github.com/Arjun31415/Firefly-cli
 
-For the RGB logic (Implementing this cli)
