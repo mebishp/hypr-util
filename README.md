@@ -18,3 +18,9 @@ Fan curve and keyboard RGB control for this HP Omen laptop.
 ```
 
 Installs missing packages, builds `firefly-ctl`, and installs the udev rule, systemd service, and desktop entries. Safe to re-run after pulling changes, it only touches what actually changed.
+
+## Acknowledgement
+
+https://github.com/Arjun31415/Firefly-cli
+
+For the RGB logic (Implementing this cli)
