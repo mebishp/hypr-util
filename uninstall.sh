@@ -25,7 +25,7 @@ log "stopping and disabling services"
 # legacy names are included so a machine installed from an older layout is
 # fully cleaned up too.
 systemctl --user disable --now hypr-util-daemon.service hypr-util-tray.service 2>/dev/null || true
-sudo systemctl disable --now hypr-util-fancurve.service fancurve.service 2>/dev/null || true
+sudo systemctl disable --now hypr-util-fancurve.service hypr-util-kbd.service fancurve.service 2>/dev/null || true
 # The settings app is resident (hides rather than exits), so it survives
 # having its files deleted out from under it.
 pkill -f 'hyprutil app' 2>/dev/null || true
@@ -36,6 +36,7 @@ sudo rm -f \
 	"$BINDIR/hyprutil" \
 	"$BINDIR/hypr-util-fancurve" \
 	/etc/systemd/system/hypr-util-fancurve.service \
+	/etc/systemd/system/hypr-util-kbd.service \
 	/etc/systemd/system-sleep/hypr-util \
 	/etc/udev/rules.d/99-firefly-keyboard.rules \
 	/etc/systemd/system/fancurve.service \

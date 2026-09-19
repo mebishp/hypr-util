@@ -1,0 +1,21 @@
+[Unit]
+Description=hypr-util laptop keyboard lighting (HP four-zone, via the BIOS mailbox)
+After=multi-user.target
+# Restarted after resume by the /etc/systemd/system-sleep/hypr-util hook,
+# which is what puts the saved colours back on the keyboard.
+
+[Service]
+Type=simple
+# This runs as root, because the ACPI mailbox that carries the colours is
+# root-only. It reads the look saved by the desktop user who installed it --
+# setup.sh substitutes their config directory here -- and hands the control
+# socket to that user, so the settings app can reach it without being root.
+Environment=HYPR_UTIL_CONFIG_DIR=@CONFIG_DIR@
+ExecStart=@BINDIR@/hyprutil kbd-daemon
+RuntimeDirectory=hypr-util
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

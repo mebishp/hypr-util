@@ -22,6 +22,7 @@ from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, Q
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .. import fan as core
+from .. import kbd
 from .. import power
 from .. import rgb
 
@@ -170,6 +171,27 @@ class FanTray(QSystemTrayIcon):
         self.menu.addMenu(brightness_menu)
         self._actions.append(brightness_menu)
 
+        # The laptop's own keyboard, which is a different device from the
+        # Firefly above it: four zones behind the BIOS mailbox, driven by
+        # the root lighting service. Disabled until that service answers,
+        # so a click cannot silently do nothing.
+        self.kbd_menu = QMenu("Laptop Keyboard")
+        self.kbd_menu.setEnabled(False)
+        self.kbd_menu.addAction(
+            self._make_action("Backlight on", slot=lambda checked: self.set_kbd(on=True))
+        )
+        self.kbd_menu.addAction(
+            self._make_action("Backlight off", slot=lambda checked: self.set_kbd(on=False))
+        )
+        self.kbd_menu.addSeparator()
+        for effect in kbd.EFFECTS:
+            self.kbd_menu.addAction(self._make_action(
+                kbd.EFFECT_LABELS[effect],
+                slot=lambda checked, e=effect: self.set_kbd(effect=e),
+            ))
+        self.menu.addMenu(self.kbd_menu)
+        self._actions.append(self.kbd_menu)
+
         self.menu.addSeparator()
         open_app_action = self._make_action("Open hypr-util...", slot=self.open_app)
         self.menu.addAction(open_app_action)
@@ -262,6 +284,25 @@ class FanTray(QSystemTrayIcon):
             except Exception:
                 logger.exception("failed to apply RGB preset %r", slot)
 
+    def set_kbd(self, on=None, effect=None):
+        threading.Thread(
+            target=self._set_kbd_worker, args=(on, effect), daemon=True
+        ).start()
+
+    def _set_kbd_worker(self, on, effect):
+        try:
+            look = dict(kbd.read_current())
+            if on is not None:
+                look["on"] = on
+            if effect is not None:
+                # Picking an effect with the backlight off is asking to see
+                # it, not to set it up for later.
+                look["effect"] = effect
+                look["on"] = True
+            kbd.apply(look)
+        except Exception:
+            logger.exception("failed to change the laptop keyboard lighting")
+
     def refresh(self):
         # power.service_active() is a D-Bus round trip (not a subprocess
         # fork, but still I/O); gather it off the main thread, skipping if
@@ -291,7 +332,7 @@ class FanTray(QSystemTrayIcon):
             self._status_ready.emit({
                 "temp": s["temp"], "pwm": s["pwm"], "fan1": s["fan1"], "fan2": s["fan2"],
                 "active": active, "override": override, "active_slot": active_slot,
-                "presets": presets,
+                "presets": presets, "kbd": kbd.available(),
             })
         finally:
             self._refreshing = False
@@ -310,6 +351,8 @@ class FanTray(QSystemTrayIcon):
             # keyboard, rather than leaving a tick on whichever preset was
             # applied last -- that tick used to outlive the colours it named.
             act.setChecked(slot == data["active_slot"])
+
+        self.kbd_menu.setEnabled(bool(data.get("kbd")))
 
         self._update_status_text()
 

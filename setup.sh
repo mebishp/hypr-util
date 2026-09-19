@@ -11,6 +11,7 @@
 #   $PREFIX/bin/hyprutil                launcher
 #   $PREFIX/bin/hypr-util-fancurve      fan curve daemon script
 #   /etc/systemd/system/                hypr-util-fancurve.service
+#                                       hypr-util-kbd.service
 #   /etc/systemd/system-sleep/hypr-util suspend/resume hook
 #   /etc/udev/rules.d/                  99-firefly-keyboard.rules
 #   ~/.config/systemd/user/             hypr-util-{daemon,tray}.service
@@ -30,7 +31,7 @@ DATA_DIR=${XDG_DATA_HOME:-$HOME/.local/share}
 APP_CONFIG_DIR=$CONFIG_DIR/hypr-util
 
 USER_UNITS=(hypr-util-daemon.service hypr-util-tray.service)
-SYSTEM_UNIT=hypr-util-fancurve.service
+SYSTEM_UNITS=(hypr-util-fancurve.service hypr-util-kbd.service)
 
 log() { printf '[setup] %s\n' "$*"; }
 die() { printf '[setup] error: %s\n' "$*" >&2; exit 1; }
@@ -55,10 +56,14 @@ check_preconditions() {
 
 install_packages() {
 	if ! command -v pacman >/dev/null; then
-		log "pacman not found; install these manually if missing: python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon"
+		log "pacman not found; install these manually if missing: python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon acpi_call"
 		return
 	fi
-	local pkgs=(python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon)
+	# acpi_call is what carries the laptop keyboard's colours: the kernel's
+	# own hp-wmi driver speaks this BIOS mailbox but exposes nothing for
+	# lighting, and there is no other route to it from userspace. Everything
+	# else still works without it; only the Laptop page goes dark.
+	local pkgs=(python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon acpi_call)
 	local missing=()
 	local pkg
 	for pkg in "${pkgs[@]}"; do
@@ -86,7 +91,7 @@ stop_services() {
 		--object-path /org/hyprnon/hyprutil \
 		--method org.freedesktop.Application.ActivateAction quit '[]' '{}' >/dev/null 2>&1 || true
 	pkill -f 'hyprutil app' 2>/dev/null || true
-	sudo systemctl stop "$SYSTEM_UNIT" 2>/dev/null || true
+	sudo systemctl stop "${SYSTEM_UNITS[@]}" 2>/dev/null || true
 }
 
 # Paths used by versions of this project before the current layout. Left
@@ -127,7 +132,10 @@ install_system_units() {
 	log "installing system units and rules"
 	sudo install -D -m 644 "$SRC/udev/99-firefly-keyboard.rules" /etc/udev/rules.d/99-firefly-keyboard.rules
 	sudo install -D -m 755 "$SRC/sleep/hypr-util" /etc/systemd/system-sleep/hypr-util
-	render_install 644 "$SRC/systemd/system/$SYSTEM_UNIT" "/etc/systemd/system/$SYSTEM_UNIT" sudo
+	local unit
+	for unit in "${SYSTEM_UNITS[@]}"; do
+		render_install 644 "$SRC/systemd/system/$unit" "/etc/systemd/system/$unit" sudo
+	done
 
 	sudo udevadm control --reload-rules
 	sudo udevadm trigger
@@ -152,7 +160,7 @@ install_user_files() {
 
 start_services() {
 	log "enabling and starting services"
-	sudo systemctl enable --now "$SYSTEM_UNIT"
+	sudo systemctl enable --now "${SYSTEM_UNITS[@]}"
 
 	systemctl --user enable "${USER_UNITS[@]}" >/dev/null
 	if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then

@@ -1,6 +1,9 @@
 #!/bin/bash
 # systemd-sleep hook: stop the fan curve daemon before suspend and hand pwm1
-# back to firmware auto mode, then restart it on resume.
+# back to firmware auto mode, then restart it on resume. On the way back it
+# also restarts the keyboard lighting service, which re-applies the saved
+# zone colours -- the firmware brings the backlight back at its own default
+# after a resume, not at whatever was last set.
 #
 # Without this, hypr-util-fancurve.service keeps
 # pwm1_enable in manual mode across suspend -- the fan is pinned at its last
@@ -14,6 +17,7 @@
 set -euo pipefail
 
 SERVICE="hypr-util-fancurve.service"
+KBD_SERVICE="hypr-util-kbd.service"
 FLAG="/run/hypr-util-fancurve-was-active"
 
 case "$1" in
@@ -28,5 +32,9 @@ post)
 		rm -f "$FLAG"
 		systemctl start "$SERVICE"
 	fi
+	# try-restart, not restart: a machine where the lighting service was
+	# never started (no acpi_call, or no controllable keyboard) should not
+	# have one started for it by waking up.
+	systemctl try-restart "$KBD_SERVICE" || true
 	;;
 esac

@@ -1,9 +1,10 @@
 """hyprutil: unified command-line entry point.
 
-Dispatches to the settings app, tray icon, automation daemon, or a one-off
-RGB flash test.
+Dispatches to the settings app, tray icon, automation daemon, the laptop
+keyboard lighting service, or a one-off RGB flash test.
 """
 import argparse
+import json
 import sys
 
 
@@ -42,6 +43,79 @@ def _run_flash(args):
     print("reverted")
 
 
+def _run_kbd_daemon(args):
+    from .kbd.service import main
+    main()
+
+
+def _kbd_zone_indices(name):
+    from . import kbd
+
+    names = {kbd.ZONE_NAMES[z].lower(): z for z in kbd.DISPLAY_ORDER}
+    if name == "all":
+        return list(names.values())
+    if name not in names:
+        raise SystemExit(f"unknown zone {name!r}; pick one of all, {', '.join(names)}")
+    return [names[name]]
+
+
+def _run_kbd(args):
+    """The laptop's own four-zone keyboard. See hyprutil/kbd/ for the protocol."""
+    from . import kbd
+
+    try:
+        if args.kbd_command == "probe":
+            print(json.dumps(kbd.probe(), indent=2))
+            return
+        if args.kbd_command == "status":
+            reply = kbd.status()
+            keyboard = reply.get("keyboard")
+            print(f"keyboard:   {keyboard['describe'] if keyboard else 'none'}"
+                  + (f" (type {keyboard['type']}, {keyboard['type_name']})" if keyboard else ""))
+            print(f"backlight:  {'on' if reply.get('lit') else 'off'}")
+            look = reply.get("look") or {}
+            print(f"effect:     {look.get('effect')} at speed {look.get('speed')}")
+            print(f"brightness: {look.get('brightness')}")
+            for zone in kbd.DISPLAY_ORDER:
+                colors = look.get("colors") or []
+                if zone < len(colors):
+                    print(f"  {kbd.ZONE_NAMES[zone]:<7} #{colors[zone]}")
+            if reply.get("error"):
+                print(f"error:      {reply['error']}")
+            return
+
+        look = dict(kbd.read_current())
+        if args.kbd_command == "on":
+            look["on"] = True
+        elif args.kbd_command == "off":
+            look["on"] = False
+        else:  # set
+            if args.color:
+                color = kbd.to_hex(args.color.lstrip("#"))
+                colors = list(look["colors"])
+                for zone in _kbd_zone_indices(args.zone):
+                    colors[zone] = color
+                look["colors"] = colors
+                look["on"] = True
+            if args.effect:
+                look["effect"] = args.effect
+            if args.speed is not None:
+                look["speed"] = args.speed
+            if args.brightness is not None:
+                look["brightness"] = args.brightness
+        kbd.apply(look)
+        print("applied")
+    except kbd.ServiceUnavailable as e:
+        raise SystemExit(
+            f"{e}\n"
+            "The lighting service is not running. Start it with\n"
+            "    sudo systemctl start hypr-util-kbd.service\n"
+            "or run this command under sudo to drive the keyboard directly."
+        )
+    except kbd.MailboxError as e:
+        raise SystemExit(str(e))
+
+
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
 
@@ -60,6 +134,24 @@ def main(argv=None):
     sub.add_parser("app", help="Open the settings window (GTK4/Adwaita)")
     sub.add_parser("tray", help="Run the tray icon (PyQt6)").set_defaults(func=_run_tray)
     sub.add_parser("daemon", help="Run the automation daemon").set_defaults(func=_run_daemon)
+
+    kbd_parser = sub.add_parser("kbd", help="Laptop keyboard lighting (four zones)")
+    kbd_sub = kbd_parser.add_subparsers(dest="kbd_command", required=True)
+    kbd_sub.add_parser("status", help="What the keyboard is showing")
+    kbd_sub.add_parser("probe", help="Diagnostics: transport, keyboard type, raw values")
+    kbd_sub.add_parser("on", help="Turn the backlight on")
+    kbd_sub.add_parser("off", help="Turn the backlight off")
+    kbd_set = kbd_sub.add_parser("set", help="Change colour, effect, speed or brightness")
+    kbd_set.add_argument("--color", help="hex colour, e.g. ff0000")
+    kbd_set.add_argument("--zone", default="all", help="all, left, middle, right or wasd")
+    kbd_set.add_argument("--effect", choices=["static", "breathe", "cycle", "wave"])
+    kbd_set.add_argument("--speed", type=int, choices=range(1, 6))
+    kbd_set.add_argument("--brightness", type=int, metavar="0-100")
+    kbd_parser.set_defaults(func=_run_kbd)
+
+    sub.add_parser(
+        "kbd-daemon", help="Run the root keyboard lighting service (systemd starts this)"
+    ).set_defaults(func=_run_kbd_daemon)
 
     flash_parser = sub.add_parser("flash", help="Manually apply an RGB effect/color, then revert")
     flash_parser.add_argument("effect", nargs="?")

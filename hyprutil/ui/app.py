@@ -12,6 +12,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gio, GLib, Gtk
 
 from .. import fan as backend
+from .. import kbd as kbd_backend
 from .. import rgb as rgb_backend
 
 Adw.init()
@@ -770,6 +771,378 @@ def _rgba_to_hex(rgba):
     )
 
 
+class LaptopKbdPage(Gtk.Box):
+    """The laptop's own keyboard: four zones, driven through the BIOS.
+
+    A different keyboard from the RGB page's, with a different set of
+    honest limits. There are four zones and no more, the firmware runs no
+    animations of its own (so an effect is this app writing frames), and
+    everything needs the root service, because the mailbox that carries the
+    colours is root-only. When that service is missing the page says so and
+    says what to run, rather than showing controls that do nothing.
+    """
+
+    APPLY_DEBOUNCE_MS = 200
+    PREVIEW_INTERVAL_MS = 120
+
+    def __init__(self):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.toast_overlay = Adw.ToastOverlay()
+        self.append(self.toast_overlay)
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.toast_overlay.set_child(content)
+
+        self.banner = Adw.Banner(title="Keyboard lighting service not available")
+        content.append(self.banner)
+
+        scroller = Gtk.ScrolledWindow(vexpand=True)
+        page = Adw.PreferencesPage()
+        scroller.set_child(page)
+        content.append(scroller)
+
+        self._look = kbd_backend.read_current()
+        self._zones = 4
+        self._loading = False
+        self._apply_timer_id = None
+        self._preview_timer_id = None
+        self._phase = 0.0
+        self._busy = False
+
+        preview_group = Adw.PreferencesGroup()
+        page.add(preview_group)
+        self.preview = _ZonePreview()
+        preview_row = Adw.ActionRow()
+        preview_row.set_child(self.preview)
+        preview_group.add(preview_row)
+
+        lighting = Adw.PreferencesGroup(
+            title="Backlight",
+            description="The keyboard built into the laptop, lit in four zones",
+        )
+        page.add(lighting)
+
+        self.on_row = Adw.SwitchRow(title="Lighting")
+        self.on_row.connect("notify::active", self._on_switch_changed)
+        lighting.add(self.on_row)
+
+        self.effect_row = Adw.ComboRow(title="Effect")
+        self.effect_row.set_model(
+            Gtk.StringList.new([kbd_backend.EFFECT_LABELS[e] for e in kbd_backend.EFFECTS])
+        )
+        self.effect_row.connect("notify::selected", self._on_effect_changed)
+        lighting.add(self.effect_row)
+
+        self.brightness_row, self.brightness_scale = self._make_slider(
+            "Brightness", 0, kbd_backend.BRIGHTNESS_MAX, self._on_brightness_changed
+        )
+        lighting.add(self.brightness_row)
+
+        self.speed_row, self.speed_scale = self._make_slider(
+            "Speed", kbd_backend.SPEED_MIN, kbd_backend.SPEED_MAX, self._on_speed_changed
+        )
+        lighting.add(self.speed_row)
+
+        self.zones_group = Adw.PreferencesGroup(title="Zones")
+        page.add(self.zones_group)
+        self._zone_rows = {}
+        for zone in kbd_backend.DISPLAY_ORDER:
+            row = Adw.ActionRow(title=kbd_backend.ZONE_NAMES[zone])
+            button = Gtk.ColorDialogButton(
+                dialog=Gtk.ColorDialog(with_alpha=False), valign=Gtk.Align.CENTER
+            )
+            button.connect("notify::rgba", self._on_zone_color_changed, zone)
+            row.add_suffix(button)
+            self.zones_group.add(row)
+            self._zone_rows[zone] = (row, button)
+
+        all_row = Adw.ActionRow(
+            title="All zones", subtitle="Paint every zone the same colour"
+        )
+        self.all_btn = Gtk.ColorDialogButton(
+            dialog=Gtk.ColorDialog(with_alpha=False), valign=Gtk.Align.CENTER
+        )
+        self.all_btn.connect("notify::rgba", self._on_all_color_changed)
+        all_row.add_suffix(self.all_btn)
+        self.zones_group.add(all_row)
+
+        factory = Gtk.Button(label="Factory colours", margin_top=8)
+        factory.connect("clicked", self._on_factory_clicked)
+        self.zones_group.add(factory)
+
+        self._load_look_into_controls()
+        self.connect("map", self._on_map)
+        self.connect("unmap", self._on_unmap)
+
+    # -- small builders --
+
+    def _make_slider(self, title, lower, upper, handler):
+        row = Adw.ActionRow(title=title)
+        scale = Gtk.Scale(
+            orientation=Gtk.Orientation.HORIZONTAL,
+            adjustment=Gtk.Adjustment(lower=lower, upper=upper, step_increment=1, page_increment=1),
+            hexpand=True, draw_value=True, digits=0, valign=Gtk.Align.CENTER,
+            width_request=220,
+        )
+        scale.set_value_pos(Gtk.PositionType.RIGHT)
+        scale.connect("value-changed", handler)
+        row.add_suffix(scale)
+        return row, scale
+
+    # -- service state --
+
+    def _on_map(self, *_):
+        self._refresh_status()
+        if self._preview_timer_id is None:
+            self._preview_timer_id = GLib.timeout_add(
+                self.PREVIEW_INTERVAL_MS, self._preview_tick
+            )
+
+    def _on_unmap(self, *_):
+        if self._preview_timer_id is not None:
+            GLib.source_remove(self._preview_timer_id)
+            self._preview_timer_id = None
+
+    def _refresh_status(self):
+        threading.Thread(target=self._status_worker, daemon=True).start()
+
+    def _status_worker(self):
+        try:
+            reply = kbd_backend.status()
+        except Exception as e:
+            reply = {"ok": False, "error": str(e), "unreachable": True}
+        GLib.idle_add(self._apply_status, reply)
+
+    def _apply_status(self, reply):
+        keyboard = reply.get("keyboard") or {}
+        usable = bool(keyboard.get("usable"))
+        if reply.get("unreachable"):
+            self.banner.set_title(
+                "Lighting service not running — start it with "
+                "sudo systemctl start hypr-util-kbd.service"
+            )
+        elif not keyboard:
+            self.banner.set_title(reply.get("error") or "No controllable keyboard lighting")
+        elif not usable:
+            # A per-key board answers every one of these calls and lights
+            # nothing by them; saying so beats letting someone chase a
+            # colour picker that cannot work.
+            self.banner.set_title(
+                f"This keyboard is {keyboard.get('describe')} — the firmware "
+                "cannot drive it"
+            )
+        self.banner.set_revealed(not usable)
+        self.set_sensitive_controls(usable)
+        if usable:
+            self._zones = int(keyboard.get("zones") or 4)
+            look = reply.get("look")
+            if look and not self._busy:
+                self._look = kbd_backend.normalize_look(look)
+                self._load_look_into_controls()
+        return False
+
+    def set_sensitive_controls(self, sensitive):
+        for widget in (self.on_row, self.effect_row, self.brightness_row,
+                       self.speed_row, self.zones_group):
+            widget.set_sensitive(sensitive)
+
+    # -- controls <-> look --
+
+    def _load_look_into_controls(self):
+        look = self._look
+        self._loading = True
+        self.on_row.set_active(look["on"])
+        self.effect_row.set_selected(kbd_backend.EFFECTS.index(look["effect"]))
+        self.brightness_scale.set_value(look["brightness"])
+        self.speed_scale.set_value(look["speed"])
+        for zone, (_row, button) in self._zone_rows.items():
+            button.set_rgba(_hex_to_rgba(look["colors"][zone]))
+        self._loading = False
+        self._sync_control_visibility()
+
+    def _sync_control_visibility(self):
+        """Show only what this look can use."""
+        animated = self._look["effect"] in kbd_backend.ANIMATED
+        self.speed_row.set_visible(animated)
+        # Cycle and wave run the whole spectrum and never read the zone
+        # colours, so the pickers would be lying if they stayed live.
+        picks_colors = self._look["effect"] in ("static", "breathe")
+        self.zones_group.set_visible(picks_colors)
+        for zone, (row, _button) in self._zone_rows.items():
+            row.set_visible(zone < self._zones or self._zones == 1)
+
+    def _on_switch_changed(self, row, *_):
+        if self._loading:
+            return
+        self._look["on"] = row.get_active()
+        self._look_changed()
+
+    def _on_effect_changed(self, row, *_):
+        if self._loading:
+            return
+        self._look["effect"] = kbd_backend.EFFECTS[row.get_selected()]
+        self._phase = 0.0
+        self._sync_control_visibility()
+        self._look_changed()
+
+    def _on_brightness_changed(self, scale):
+        if self._loading:
+            return
+        self._look["brightness"] = int(scale.get_value())
+        self._look_changed()
+
+    def _on_speed_changed(self, scale):
+        if self._loading:
+            return
+        self._look["speed"] = int(scale.get_value())
+        self._look_changed()
+
+    def _on_zone_color_changed(self, button, _param, zone):
+        if self._loading:
+            return
+        hexval = _rgba_to_hex(button.get_rgba())
+        if self._look["colors"][zone] == hexval:
+            return
+        self._look["colors"][zone] = hexval
+        self._look["on"] = True
+        self._loading = True
+        self.on_row.set_active(True)
+        self._loading = False
+        self._look_changed()
+
+    def _on_all_color_changed(self, button, *_):
+        if self._loading:
+            return
+        hexval = _rgba_to_hex(button.get_rgba())
+        self._look["colors"] = [hexval] * len(self._look["colors"])
+        self._look["on"] = True
+        self._load_look_into_controls()
+        self._look_changed()
+
+    def _on_factory_clicked(self, *_):
+        self._look["colors"] = list(kbd_backend.FACTORY_COLORS)
+        self._look["on"] = True
+        self._load_look_into_controls()
+        self._look_changed()
+
+    def _look_changed(self):
+        self.preview.set_look(self._look, self._zones, self._phase)
+        self._schedule_apply()
+
+    # -- applying --
+
+    def _schedule_apply(self):
+        if self._apply_timer_id is not None:
+            GLib.source_remove(self._apply_timer_id)
+        self._apply_timer_id = GLib.timeout_add(self.APPLY_DEBOUNCE_MS, self._fire_apply)
+
+    def _fire_apply(self):
+        # Coalesced: dragging a slider produces a change per pixel and every
+        # one of them is a pair of ACPI calls on the other side of a socket.
+        self._apply_timer_id = None
+        look = kbd_backend.normalize_look(self._look)
+        self._busy = True
+        threading.Thread(target=self._apply_worker, args=(look,), daemon=True).start()
+        return False
+
+    def _apply_worker(self, look):
+        error = None
+        try:
+            kbd_backend.apply(look)
+        except Exception as e:
+            error = str(e)
+        GLib.idle_add(self._after_apply, error)
+
+    def _after_apply(self, error):
+        self._busy = False
+        if error:
+            self._show_toast(error)
+        return False
+
+    def _show_toast(self, title):
+        toast = Adw.Toast(title=title)
+        toast.set_timeout(3)
+        self.toast_overlay.add_toast(toast)
+
+    # -- preview --
+
+    def _preview_tick(self):
+        """Run the drawn keyboard from the same frame function the daemon
+        writes to the hardware, so the preview is the effect rather than an
+        impression of it."""
+        if self._look["on"] and self._look["effect"] in kbd_backend.ANIMATED:
+            self._phase += kbd_backend.zones.PHASE_STEP * kbd_backend.zones.SPEED_FACTORS[
+                self._look["speed"]
+            ]
+        self.preview.set_look(self._look, self._zones, self._phase)
+        return True
+
+
+class _ZonePreview(Gtk.DrawingArea):
+    """The four zones as they sit on the keyboard: three bands across, with
+    the WASD cluster picked out over the left one."""
+
+    def __init__(self, height=96):
+        super().__init__()
+        self._colors = []
+        self._on = True
+        self.set_content_height(height)
+        self.set_hexpand(True)
+        self.set_draw_func(self._draw)
+
+    def set_look(self, look, zones, phase):
+        self._colors = kbd_backend.frame_colors(look, zones, phase)
+        self._on = look["on"]
+        self.queue_draw()
+
+    def _zone_color(self, zone):
+        if zone < len(self._colors):
+            return self._colors[zone]
+        return self._colors[0] if self._colors else (0, 0, 0)
+
+    def _draw(self, _area, cr, width, height):
+        pad = 6
+        w, h = width - 2 * pad, height - 2 * pad
+        bands = [kbd_backend.ZONE_LEFT, kbd_backend.ZONE_MIDDLE, kbd_backend.ZONE_RIGHT]
+        if len(self._colors) == 1:
+            bands = [0, 0, 0]
+        step = w / len(bands)
+        _rounded_rect(cr, pad, pad, w, h, 10)
+        cr.clip_preserve()
+        for i, zone in enumerate(bands):
+            r, g, b = self._zone_color(zone)
+            alpha = 1.0 if self._on else 0.18
+            cr.set_source_rgba(r / 255, g / 255, b / 255, alpha)
+            # +1 so neighbouring bands overlap by a subpixel; without it
+            # antialiasing leaves a pale seam between them.
+            cr.rectangle(pad + i * step, pad, step + 1, h)
+            cr.fill()
+        cr.reset_clip()
+
+        if len(self._colors) > kbd_backend.ZONE_WASD:
+            r, g, b = self._zone_color(kbd_backend.ZONE_WASD)
+            cluster_w, cluster_h = min(74.0, step * 0.8), min(34.0, h * 0.42)
+            x = pad + step * 0.5 - cluster_w / 2
+            y = pad + h * 0.52
+            _rounded_rect(cr, x, y, cluster_w, cluster_h, 6)
+            cr.set_source_rgba(r / 255, g / 255, b / 255, 1.0 if self._on else 0.18)
+            cr.fill_preserve()
+            cr.set_source_rgba(0, 0, 0, 0.35)
+            cr.set_line_width(1)
+            cr.stroke()
+            cr.select_font_face("Sans", 0, 0)
+            cr.set_font_size(10)
+            luma = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+            cr.set_source_rgba(0, 0, 0, 0.8) if luma > 0.55 else cr.set_source_rgba(1, 1, 1, 0.9)
+            extents = cr.text_extents("WASD")
+            cr.move_to(x + (cluster_w - extents.width) / 2, y + cluster_h / 2 + 3.5)
+            cr.show_text("WASD")
+
+        _rounded_rect(cr, pad + 0.5, pad + 0.5, w - 1, h - 1, 10)
+        cr.set_source_rgba(0, 0, 0, 0.22)
+        cr.set_line_width(1)
+        cr.stroke()
+
+
 class HyprUtilWindow(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(
@@ -788,6 +1161,9 @@ class HyprUtilWindow(Adw.ApplicationWindow):
         )
         self.view_stack.add_titled_with_icon(
             RgbPage(), "rgb", "RGB", "input-keyboard-symbolic"
+        )
+        self.view_stack.add_titled_with_icon(
+            LaptopKbdPage(), "kbd", "Laptop", "keyboard-brightness-symbolic"
         )
 
         header = Adw.HeaderBar()
