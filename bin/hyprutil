@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""hyprutil unified launcher -- see hyprutil/cli.py for the actual implementation."""
+"""hyprutil launcher for running straight from a checkout.
+
+The installed copy at <prefix>/bin/hyprutil is generated from
+system/bin/hyprutil.in instead, and points at the installed package rather
+than at this repo -- see setup.sh.
+"""
 import sys
 from pathlib import Path
 

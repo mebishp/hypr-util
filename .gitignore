@@ -13,3 +13,10 @@ target/
 # Editors / OS
 .DS_Store
 *.swp
+
+# Vendor and reference material kept in the tree but not part of this project:
+# ohman/ is the Windows OMEN utility whose research notes documented the
+# laptop keyboard mailbox, and the Firefly installer is where the HID
+# protocol was read from. Both are large, neither is ours to redistribute.
+ohman/
+*.exe

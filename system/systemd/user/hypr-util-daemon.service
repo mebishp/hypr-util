@@ -1,0 +1,13 @@
+[Unit]
+Description=hypr-util automation daemon (display refresh rate + RGB reaction to power profile, RGB restore on resume)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/hyprutil daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,66 +1,63 @@
-#!/bin/bash
-# Symmetric teardown for setup.sh: stops/disables the services it enabled,
-# removes every file it installed outside this repo, clears Focus mode's
-# /etc/hosts block + nftables table, and strips the setcap grant on
-# firefly-ctl. Doesn't touch the repo itself or distro packages installed by
-# install_packages -- only what setup.sh scattered across the filesystem.
+#!/usr/bin/env bash
+# Teardown for setup.sh: stops and disables every service it enabled and
+# removes every file it installed outside this repo, including the paths used
+# by older layouts of this project.
+#
+# Leaves alone: the repo itself, distro packages installed by setup.sh's
+# install_packages, and your settings in ~/.config/hypr-util.
 set -euo pipefail
 
-if [ "${EUID:-$(id -u)}" -eq 0 ]; then
-	echo "[uninstall] Do not run as root / with sudo. Run as your normal user:" >&2
-	echo "[uninstall]   ./uninstall.sh   (it calls sudo itself for system steps)" >&2
-	exit 1
-fi
+PREFIX=${PREFIX:-/usr/local}
+BINDIR=$PREFIX/bin
+LIBDIR=$PREFIX/lib/hypr-util
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}
+DATA_DIR=${XDG_DATA_HOME:-$HOME/.local/share}
 
-log() { echo "[uninstall] $*" >&2; }
+log() { printf '[uninstall] %s\n' "$*"; }
+die() { printf '[uninstall] error: %s\n' "$*" >&2; exit 1; }
 
-log "clearing focus mode blocks (hosts + nftables), if any"
-if command -v pkexec >/dev/null 2>&1 && [ -x /usr/local/bin/hypr-util-focus-hosts ]; then
-	pkexec /usr/local/bin/hypr-util-focus-hosts off 2>/dev/null || true
-fi
-if command -v pkexec >/dev/null 2>&1 && [ -x /usr/local/bin/hypr-util-focus-fw ]; then
-	pkexec /usr/local/bin/hypr-util-focus-fw off 2>/dev/null || true
-fi
+[ "${EUID:-$(id -u)}" -ne 0 ] || die "do not run as root; run ./uninstall.sh as your normal user (it calls sudo itself)"
+command -v sudo >/dev/null || die "sudo is required"
 
-log "stopping/disabling user services"
-systemctl --user stop hypr-util-daemon.service 2>/dev/null || true
-systemctl --user disable hypr-util-daemon.service 2>/dev/null || true
-pkill -f "bin/hyprutil tray" 2>/dev/null || true
+log "stopping and disabling services"
+# --now so this both stops the running unit and clears its enablement; the
+# legacy names are included so a machine installed from an older layout is
+# fully cleaned up too.
+systemctl --user disable --now hypr-util-daemon.service hypr-util-tray.service 2>/dev/null || true
+sudo systemctl disable --now hypr-util-fancurve.service fancurve.service 2>/dev/null || true
+# The settings app is resident (hides rather than exits), so it survives
+# having its files deleted out from under it.
+pkill -f 'hyprutil app' 2>/dev/null || true
 
-log "stopping/disabling system services"
-sudo systemctl stop fancurve.service 2>/dev/null || true
-sudo systemctl disable fancurve.service 2>/dev/null || true
-
-log "removing installed system files"
+log "removing system files"
+sudo rm -rf "$LIBDIR"
 sudo rm -f \
+	"$BINDIR/hyprutil" \
+	"$BINDIR/hypr-util-fancurve" \
+	/etc/systemd/system/hypr-util-fancurve.service \
+	/etc/systemd/system-sleep/hypr-util \
 	/etc/udev/rules.d/99-firefly-keyboard.rules \
 	/etc/systemd/system/fancurve.service \
 	/usr/local/bin/fancurve.sh \
-	/usr/lib/systemd/system-sleep/hypr-util \
-	/usr/local/bin/hypr-util-focus-hosts \
-	/usr/local/bin/hypr-util-focus-fw \
-	/etc/polkit-1/rules.d/49-hypr-util-focus.rules
+	/usr/lib/systemd/system-sleep/hypr-util
+
+log "removing user files"
+rm -f \
+	"$CONFIG_DIR/systemd/user/hypr-util-daemon.service" \
+	"$CONFIG_DIR/systemd/user/hypr-util-tray.service" \
+	"$DATA_DIR/applications/org.hyprnon.hyprutil.desktop" \
+	"$DATA_DIR/dbus-1/services/org.hyprnon.hyprutil.service" \
+	"$DATA_DIR/icons/hicolor/scalable/apps/org.hyprnon.hyprutil.svg" \
+	"$CONFIG_DIR/autostart/hypr-util.desktop" \
+	"$DATA_DIR/icons/hicolor/scalable/apps/org.hyprnon.hyprutil-v2.svg"
+
+log "reloading"
 sudo udevadm control --reload-rules 2>/dev/null || true
 sudo systemctl daemon-reload 2>/dev/null || true
-
-log "removing installed user files"
-rm -f \
-	"$HOME/.config/systemd/user/hypr-util-daemon.service" \
-	"$HOME/.config/autostart/hypr-util.desktop" \
-	"$HOME/.local/share/applications/org.hyprnon.hyprutil.desktop" \
-	"$HOME/.local/share/dbus-1/services/org.hyprnon.hyprutil.service" \
-	"$HOME/.local/share/icons/hicolor/scalable/apps/org.hyprnon.hyprutil-v2.svg" \
-	"$HOME/.local/share/hypr-util/focus-wallpaper.svg" \
-	"$HOME/.local/share/hypr-util/focus-wallpaper-dark.svg"
-rmdir "$HOME/.local/share/hypr-util" 2>/dev/null || true
 systemctl --user daemon-reload 2>/dev/null || true
+gtk-update-icon-cache -f -t "$DATA_DIR/icons/hicolor" >/dev/null 2>&1 || true
+update-desktop-database "$DATA_DIR/applications" >/dev/null 2>&1 || true
 
-if [ -f "$REPO_DIR/firefly-ctl/target/debug/firefly-ctl" ]; then
-	log "removing setcap grant on firefly-ctl"
-	sudo setcap -r "$REPO_DIR/firefly-ctl/target/debug/firefly-ctl" 2>/dev/null || true
-fi
-
-log "done -- repo contents, ~/.config/hypr-util state, and distro packages were left untouched"
-log "remove those yourself if you want a full wipe: rm -rf ~/.config/hypr-util $REPO_DIR"
+log "done -- settings in $CONFIG_DIR/hypr-util and this repo were left untouched"
+log "for a full wipe: rm -rf $CONFIG_DIR/hypr-util"

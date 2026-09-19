@@ -1,305 +1,180 @@
-#!/bin/bash
-# Idempotent installer/updater for hypr-util.
+#!/usr/bin/env bash
+# Installer/updater for hypr-util.
 #
-# Safe to re-run any time (e.g. after `git pull`): only touches the system
-# files that actually changed, and only restarts/reloads the services that
-# own them, instead of always reinstalling everything from scratch.
+# Installs into $PREFIX (default /usr/local) plus the usual per-user XDG and
+# systemd directories, then restarts everything so the running processes are
+# the code that was just installed. Safe to re-run after `git pull`.
+#
+# Layout installed (mirrors the system/ tree in this repo):
+#
+#   $PREFIX/lib/hypr-util/hyprutil/     Python package
+#   $PREFIX/bin/hyprutil                launcher
+#   $PREFIX/bin/hypr-util-fancurve      fan curve daemon script
+#   /etc/systemd/system/                hypr-util-fancurve.service
+#   /etc/systemd/system-sleep/hypr-util suspend/resume hook
+#   /etc/udev/rules.d/                  99-firefly-keyboard.rules
+#   ~/.config/systemd/user/             hypr-util-{daemon,tray}.service
+#   ~/.local/share/applications/        desktop entry
+#   ~/.local/share/dbus-1/services/     D-Bus activation file
+#   ~/.local/share/icons/hicolor/       app icon
 set -euo pipefail
 
-if [ "${EUID:-$(id -u)}" -eq 0 ]; then
-	echo "[setup] Do not run as root / with sudo. Run as your normal user:" >&2
-	echo "[setup]   ./setup.sh   (it calls sudo itself for system steps)" >&2
-	exit 1
-fi
+PREFIX=${PREFIX:-/usr/local}
+BINDIR=$PREFIX/bin
+LIBDIR=$PREFIX/lib/hypr-util
 
-command -v sudo >/dev/null 2>&1 || { echo "[setup] sudo required" >&2; exit 1; }
-sudo -v || { echo "[setup] this installer needs sudo privileges" >&2; exit 1; }
+REPO_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+SRC=$REPO_DIR/system
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}
+DATA_DIR=${XDG_DATA_HOME:-$HOME/.local/share}
+APP_CONFIG_DIR=$CONFIG_DIR/hypr-util
 
-REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SYSTEM_DIR="$REPO_DIR/system"
+USER_UNITS=(hypr-util-daemon.service hypr-util-tray.service)
+SYSTEM_UNIT=hypr-util-fancurve.service
 
-# Any mktemp'd rendered file leaks into /tmp if we abort (set -e) before its
-# own rm -- collect them here and let one trap sweep whatever's left.
-_tmp_files=()
-cleanup_tmp_files() {
-	local f
-	for f in "${_tmp_files[@]:-}"; do
-		rm -f "$f" 2>/dev/null || true
-	done
-}
-trap cleanup_tmp_files EXIT
+log() { printf '[setup] %s\n' "$*"; }
+die() { printf '[setup] error: %s\n' "$*" >&2; exit 1; }
 
-log() {
-	# stderr, not stdout: sync_file() is called as `$(sync_file ...)` at every
-	# call site, which captures all of stdout -- if log() wrote there too,
-	# its "installing $dest" line would land in the captured value ahead of
-	# the final "changed"/"unchanged", so `[ "$result" = "changed" ]` would
-	# never match and every reload/restart-on-change branch below would
-	# silently never fire whenever a file actually changed.
-	echo "[setup] $*" >&2
+# install(1) with an explicit mode, after rendering @PLACEHOLDER@ values.
+# Modes are stated here rather than copied from the checkout, so a stray
+# chmod in the repo can't produce a non-executable helper or a world-writable
+# unit file.
+render_install() {
+	local mode=$1 src=$2 dest=$3 sudo_cmd=${4:-}
+	sed -e "s|@BINDIR@|$BINDIR|g" \
+	    -e "s|@LIBDIR@|$LIBDIR|g" \
+	    -e "s|@CONFIG_DIR@|$APP_CONFIG_DIR|g" \
+	    "$src" | $sudo_cmd install -D -m "$mode" /dev/stdin "$dest"
 }
 
-# Tracks whether anything actually changed, for the final summary.
-changed_udev=0
-changed_fancurve=0
-changed_sleep_hook=0
-changed_focus=0
-changed_daemon=0
-changed_app=0
+check_preconditions() {
+	[ "${EUID:-$(id -u)}" -ne 0 ] || die "do not run as root; run ./setup.sh as your normal user (it calls sudo itself)"
+	command -v sudo >/dev/null || die "sudo is required"
+	sudo -v || die "this installer needs sudo privileges"
+}
 
 install_packages() {
-	if ! command -v pacman >/dev/null 2>&1; then
-		log "pacman not found, skipping package install (install these manually: $*)"
+	if ! command -v pacman >/dev/null; then
+		log "pacman not found; install these manually if missing: python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon"
 		return
 	fi
-
-	local pkgs=(python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon rust gsettings-desktop-schemas nftables)
+	local pkgs=(python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon)
 	local missing=()
+	local pkg
 	for pkg in "${pkgs[@]}"; do
-		if ! pacman -Qi "$pkg" >/dev/null 2>&1; then
-			missing+=("$pkg")
-		fi
+		pacman -Qi "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
 	done
-
 	if [ "${#missing[@]}" -eq 0 ]; then
-		log "all required packages already installed"
+		log "all required packages present"
 	else
-		log "installing missing packages: ${missing[*]}"
+		log "installing: ${missing[*]}"
 		sudo pacman -S --needed "${missing[@]}"
 	fi
 }
 
-build_firefly_ctl() {
-	if ! command -v cargo >/dev/null 2>&1; then
-		log "cargo not found; skipping firefly-ctl (install rust for RGB control)"
-		return
-	fi
-	log "building firefly-ctl"
-	if ! (cd "$REPO_DIR/firefly-ctl" && cargo build); then
-		log "WARNING: firefly-ctl build failed; RGB control unavailable"
-		return
-	fi
-	sudo setcap cap_sys_admin=ep "$REPO_DIR/firefly-ctl/target/debug/firefly-ctl"
+# Stop everything before replacing files on disk.
+#
+# The settings app is the reason this exists: it is a resident, D-Bus-
+# activated GApplication that hides its window instead of exiting, so it
+# keeps owning org.hyprnon.hyprutil across a reinstall. Without quitting it
+# here, every later launch re-presents the process started from the OLD code
+# and the update looks like it silently did nothing.
+stop_services() {
+	log "stopping running instances"
+	systemctl --user stop "${USER_UNITS[@]}" 2>/dev/null || true
+	gdbus call --session --dest org.hyprnon.hyprutil \
+		--object-path /org/hyprnon/hyprutil \
+		--method org.freedesktop.Application.ActivateAction quit '[]' '{}' >/dev/null 2>&1 || true
+	pkill -f 'hyprutil app' 2>/dev/null || true
+	sudo systemctl stop "$SYSTEM_UNIT" 2>/dev/null || true
 }
 
-# sync_file <src> <dest> [use_sudo]
-# Copies src -> dest only if their contents differ. Echoes "changed" or
-# "unchanged" so callers can react.
-sync_file() {
-	local src="$1" dest="$2" use_sudo="${3:-}"
-	local src_sum dest_sum
-	src_sum=$(sha256sum "$src" | cut -d' ' -f1)
-	dest_sum=$( { [ "$use_sudo" = "sudo" ] && sudo sha256sum "$dest" || sha256sum "$dest"; } 2>/dev/null | cut -d' ' -f1 || true)
-
-	if [ "$src_sum" = "$dest_sum" ]; then
-		echo "unchanged"
-		return
-	fi
-
-	log "installing $dest"
-	if [ "$use_sudo" = "sudo" ]; then
-		sudo install -D -m "$(stat -c%a "$src")" "$src" "$dest"
-	else
-		install -D -m "$(stat -c%a "$src")" "$src" "$dest"
-	fi
-	echo "changed"
+# Paths used by versions of this project before the current layout. Left
+# behind they are not merely clutter: the old fancurve.service would keep
+# running a second fan daemon fighting this one over pwm1, and the old
+# autostart entry would launch a second tray.
+remove_legacy() {
+	log "removing pre-existing installs from the old layout"
+	systemctl --user disable --now hypr-util-tray.service 2>/dev/null || true
+	sudo systemctl disable --now fancurve.service 2>/dev/null || true
+	sudo rm -f \
+		/etc/systemd/system/fancurve.service \
+		/usr/local/bin/fancurve.sh \
+		/usr/lib/systemd/system-sleep/hypr-util
+	rm -f \
+		"$CONFIG_DIR/autostart/hypr-util.desktop" \
+		"$CONFIG_DIR/autostart/hyprnonfan.desktop" \
+		"$DATA_DIR/icons/hicolor/scalable/apps/org.hyprnon.hyprutil-v2.svg"
 }
 
-install_udev_rule() {
-	local dest="/etc/udev/rules.d/99-firefly-keyboard.rules"
-	if [ "$(sync_file "$SYSTEM_DIR/99-firefly-keyboard.rules" "$dest" sudo)" = "changed" ]; then
-		changed_udev=1
-		log "reloading udev rules"
-		sudo udevadm control --reload-rules
-		sudo udevadm trigger
-	fi
+install_program() {
+	log "installing program files into $PREFIX"
+	# Wipe the whole directory rather than just the package: it also used to
+	# hold the firefly-ctl helper binary, which no longer exists.
+	sudo rm -rf "$LIBDIR"
+	sudo install -d -m 755 "$LIBDIR"
+	sudo cp -r "$REPO_DIR/hyprutil" "$LIBDIR/hyprutil"
+	sudo find "$LIBDIR/hyprutil" -name __pycache__ -type d -prune -exec rm -rf {} +
+	sudo chown -R root:root "$LIBDIR/hyprutil"
+	sudo find "$LIBDIR/hyprutil" -type d -exec chmod 755 {} +
+	sudo find "$LIBDIR/hyprutil" -type f -exec chmod 644 {} +
+
+	render_install 755 "$SRC/bin/hyprutil.in" "$BINDIR/hyprutil" sudo
+	render_install 755 "$SRC/bin/hypr-util-fancurve" "$BINDIR/hypr-util-fancurve" sudo
 }
 
-install_fancurve_daemon() {
-	local script_dest="/usr/local/bin/fancurve.sh"
-	local unit_dest="/etc/systemd/system/fancurve.service"
-	local script_changed unit_changed
+install_system_units() {
+	log "installing system units and rules"
+	sudo install -D -m 644 "$SRC/udev/99-firefly-keyboard.rules" /etc/udev/rules.d/99-firefly-keyboard.rules
+	sudo install -D -m 755 "$SRC/sleep/hypr-util" /etc/systemd/system-sleep/hypr-util
+	render_install 644 "$SRC/systemd/system/$SYSTEM_UNIT" "/etc/systemd/system/$SYSTEM_UNIT" sudo
 
-	script_changed=$(sync_file "$SYSTEM_DIR/fancurve.sh" "$script_dest" sudo)
-	unit_changed=$(sync_file "$SYSTEM_DIR/fancurve.service" "$unit_dest" sudo)
-
-	if [ "$script_changed" = "changed" ] || [ "$unit_changed" = "changed" ]; then
-		changed_fancurve=1
-		log "reloading and restarting fancurve.service"
-		sudo systemctl daemon-reload
-		sudo systemctl restart fancurve.service
-	fi
-	sudo systemctl enable --quiet fancurve.service
-	if ! systemctl is-active --quiet fancurve.service; then
-		sudo systemctl start fancurve.service
-	fi
+	sudo udevadm control --reload-rules
+	sudo udevadm trigger
+	sudo systemctl daemon-reload
 }
 
-install_sleep_hook() {
-	# systemd-sleep hooks need no daemon-reload / enable step -- systemd reads
-	# this directory fresh on every suspend/resume, it just has to exist.
-	local dest="/usr/lib/systemd/system-sleep/hypr-util"
-	if [ "$(sync_file "$SYSTEM_DIR/hypr-util-sleep.sh" "$dest" sudo)" = "changed" ]; then
-		changed_sleep_hook=1
-	fi
-}
-
-install_focus_blocking_helpers() {
-	# Root helpers for Focus mode's site blocking (edits /etc/hosts) and
-	# IP-level blocking (a dedicated nftables table -- catches connections
-	# to already-resolved/cached IPs that a hosts-file change alone can't),
-	# plus the polkit rule that lets the automation daemon invoke both via
-	# pkexec with no interactive password prompt -- the daemon runs
-	# unattended and can't answer one. None of these need a reload/restart
-	# step: the scripts are invoked fresh via pkexec on every call, and
-	# polkit re-reads /etc/polkit-1/rules.d on its own.
-	local hosts_changed fw_changed rules_changed
-	hosts_changed=$(sync_file "$SYSTEM_DIR/hypr-util-focus-hosts.sh" "/usr/local/bin/hypr-util-focus-hosts" sudo)
-	fw_changed=$(sync_file "$SYSTEM_DIR/hypr-util-focus-fw.sh" "/usr/local/bin/hypr-util-focus-fw" sudo)
-	rules_changed=$(sync_file "$SYSTEM_DIR/49-hypr-util-focus.rules" "/etc/polkit-1/rules.d/49-hypr-util-focus.rules" sudo)
-	if [ "$hosts_changed" = "changed" ] || [ "$fw_changed" = "changed" ] || [ "$rules_changed" = "changed" ]; then
-		changed_focus=1
-	fi
-}
-
-install_focus_wallpaper() {
-	local dest_dir="$HOME/.local/share/hypr-util"
-	mkdir -p "$dest_dir"
-	sync_file "$SYSTEM_DIR/focus-wallpaper.svg" "$dest_dir/focus-wallpaper.svg" >/dev/null
-	sync_file "$SYSTEM_DIR/focus-wallpaper-dark.svg" "$dest_dir/focus-wallpaper-dark.svg" >/dev/null
-}
-
-install_automation_daemon() {
-	local dest="$HOME/.config/systemd/user/hypr-util-daemon.service"
-	local rendered result
-	rendered=$(mktemp)
-	_tmp_files+=("$rendered")
-	sed "s|%REPO_DIR%|$REPO_DIR|g" "$SYSTEM_DIR/hypr-util-daemon.service" > "$rendered"
-	chmod 644 "$rendered"
-	result=$(sync_file "$rendered" "$dest")
-	rm -f "$rendered"
-	[ "$result" = "changed" ] && changed_daemon=1
-
-	systemctl --user daemon-reload
-	systemctl --user enable --quiet hypr-util-daemon.service
-	if [ "$result" = "changed" ]; then
-		log "restarting hypr-util-daemon.service"
-		systemctl --user restart hypr-util-daemon.service
-	elif ! systemctl --user is-active --quiet hypr-util-daemon.service; then
-		systemctl --user start hypr-util-daemon.service
-	fi
-}
-
-install_autostart() {
-	local dest="$HOME/.config/autostart/hypr-util.desktop"
-	local rendered result
-
-	# Remove stale entries from old repo names so only one instance autostarts.
-	local stale
-	for stale in "$HOME/.config/autostart/hyprnonfan.desktop"; do
-		if [ -f "$stale" ]; then
-			log "removing stale autostart entry: $stale"
-			rm -f "$stale"
-		fi
+install_user_files() {
+	log "installing user units, desktop entry, and icon"
+	local unit
+	for unit in "${USER_UNITS[@]}"; do
+		render_install 644 "$SRC/systemd/user/$unit" "$CONFIG_DIR/systemd/user/$unit"
 	done
+	render_install 644 "$SRC/desktop/org.hyprnon.hyprutil.desktop" "$DATA_DIR/applications/org.hyprnon.hyprutil.desktop"
+	render_install 644 "$SRC/dbus/org.hyprnon.hyprutil.service" "$DATA_DIR/dbus-1/services/org.hyprnon.hyprutil.service"
+	install -D -m 644 "$SRC/icons/hicolor/scalable/apps/org.hyprnon.hyprutil.svg" \
+		"$DATA_DIR/icons/hicolor/scalable/apps/org.hyprnon.hyprutil.svg"
 
-	rendered=$(mktemp)
-	_tmp_files+=("$rendered")
-	sed "s|%REPO_DIR%|$REPO_DIR|g" "$SYSTEM_DIR/hypr-util.desktop" > "$rendered"
-	chmod 644 "$rendered"
-	result=$(sync_file "$rendered" "$dest")
-	rm -f "$rendered"
-
-	# Reload the systemd user session generator so the correct autostart unit
-	# is created immediately, without requiring a re-login.
-	systemctl --user daemon-reload 2>/dev/null && log "reloaded systemd user daemon" || true
+	gtk-update-icon-cache -f -t "$DATA_DIR/icons/hicolor" >/dev/null 2>&1 || true
+	update-desktop-database "$DATA_DIR/applications" >/dev/null 2>&1 || true
+	systemctl --user daemon-reload
 }
 
-ensure_tray_running() {
-	# The tray has no systemd unit and no installed copy of its own code to
-	# diff against (its desktop entry always just points straight at this
-	# repo's bin/hyprutil) -- so unlike the daemon, "did the installed file
-	# change" can't tell us whether a code update needs picking up. Always
-	# restart a currently-running tray so `git pull` + setup.sh reliably
-	# refreshes it, same as any other update here -- and also *start* it if
-	# it isn't running at all (a fresh install, or one where it crashed/was
-	# never launched), rather than leaving the user with no tray icon until
-	# their next graphical login picks up the autostart entry installed by
-	# install_autostart.
-	if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
-		# No graphical session to attach a Qt tray icon to (e.g. setup.sh
-		# run over SSH/a plain TTY) -- the autostart entry will start it at
-		# the next graphical login instead.
-		log "no graphical session detected; tray will start at next login"
-		return
-	fi
+start_services() {
+	log "enabling and starting services"
+	sudo systemctl enable --now "$SYSTEM_UNIT"
 
-	if pgrep -f "bin/hyprutil tray" >/dev/null 2>&1; then
-		log "restarting tray to pick up code changes"
-		pkill -f "bin/hyprutil tray" || true
-		# Give the old instance's instance-lock socket
-		# (/run/user/<uid>/hypr-util-tray.lock) a moment to release before
-		# starting the new one, so it doesn't see a still-listening stale
-		# lock and refuse to start (see _acquire_instance_lock() in tray.py).
-		for _ in 1 2 3 4 5 6 7 8 9 10; do
-			pgrep -f "bin/hyprutil tray" >/dev/null 2>&1 || break
-			sleep 0.2
-		done
+	systemctl --user enable "${USER_UNITS[@]}" >/dev/null
+	if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
+		systemctl --user start "${USER_UNITS[@]}"
 	else
-		log "starting tray"
-	fi
-	nohup "$REPO_DIR/bin/hyprutil" tray >/dev/null 2>&1 &
-	disown
-}
-
-install_app_launcher() {
-	local icon_dest="$HOME/.local/share/icons/hicolor/scalable/apps/org.hyprnon.hyprutil-v2.svg"
-	local desktop_dest="$HOME/.local/share/applications/org.hyprnon.hyprutil.desktop"
-	local dbus_service_dest="$HOME/.local/share/dbus-1/services/org.hyprnon.hyprutil.service"
-	local rendered_desktop rendered_service icon_changed desktop_changed
-	rendered_desktop=$(mktemp)
-	_tmp_files+=("$rendered_desktop")
-	sed "s|%REPO_DIR%|$REPO_DIR|g" "$SYSTEM_DIR/org.hyprnon.hyprutil.desktop" > "$rendered_desktop"
-	chmod 644 "$rendered_desktop"
-	rendered_service=$(mktemp)
-	_tmp_files+=("$rendered_service")
-	sed "s|%REPO_DIR%|$REPO_DIR|g" "$SYSTEM_DIR/org.hyprnon.hyprutil.service" > "$rendered_service"
-	chmod 644 "$rendered_service"
-
-	icon_changed=$(sync_file "$SYSTEM_DIR/icons/hicolor/scalable/apps/org.hyprnon.hyprutil-v2.svg" "$icon_dest")
-	desktop_changed=$(sync_file "$rendered_desktop" "$desktop_dest")
-	sync_file "$rendered_service" "$dbus_service_dest" >/dev/null
-	rm -f "$rendered_desktop" "$rendered_service"
-	[ "$desktop_changed" = "changed" ] && changed_app=1
-
-	if [ "$icon_changed" = "changed" ]; then
-		gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" >/dev/null 2>&1 || true
-	fi
-	if [ "$desktop_changed" = "changed" ]; then
-		update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
+		# graphical-session.target isn't reached from a plain TTY/SSH login,
+		# and the tray needs a display to attach its icon to; both units are
+		# enabled, so they start at the next graphical login.
+		log "no graphical session detected; daemon and tray start at next login"
 	fi
 }
 
 main() {
+	check_preconditions
 	install_packages
-	build_firefly_ctl
-	install_udev_rule
-	install_fancurve_daemon
-	install_sleep_hook
-	install_focus_blocking_helpers
-	install_focus_wallpaper
-	install_autostart
-	install_app_launcher
-	install_automation_daemon
-	ensure_tray_running
-
-	log "done"
-	if [ "$changed_udev" -eq 1 ] || [ "$changed_fancurve" -eq 1 ] || [ "$changed_sleep_hook" -eq 1 ] \
-		|| [ "$changed_focus" -eq 1 ] || [ "$changed_daemon" -eq 1 ] || [ "$changed_app" -eq 1 ]; then
-		log "system files were updated and reloaded"
-	else
-		log "everything was already up to date"
-	fi
+	stop_services
+	remove_legacy
+	install_program
+	install_system_units
+	install_user_files
+	start_services
+	log "done -- installed to $PREFIX, run 'hyprutil --help' to check"
 }
 
 main "$@"

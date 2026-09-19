@@ -15,16 +15,21 @@
 #     ramp down, let temp creep back up, and ramp up again in a loop)
 #
 # This daemon does not stop itself on suspend -- that's handled externally by
-# hypr-util-sleep.sh (a systemd-sleep hook), which stops this service before
-# sleep (triggering the cleanup trap below, handing pwm1 to firmware auto
-# mode) and restarts it on resume.
+# the /etc/systemd/system-sleep/hypr-util hook, which stops this service
+# before sleep (triggering the cleanup trap below, handing pwm1 to firmware
+# auto mode) and restarts it on resume.
 set -euo pipefail
 
 INTERVAL=5
 TEMP_HISTORY_SIZE=3
 MAX_STEP_UP=40
 MAX_STEP_DOWN=10
-CONFIG_DIR="/home/hyprnon/.config/hypr-util"
+# Supplied by the unit (Environment=HYPR_UTIL_CONFIG_DIR=...), which setup.sh
+# fills in with the installing user's config directory. This daemon runs as
+# root but reads files owned by that desktop user, so the path can't come
+# from $HOME here -- and hardcoding one user's home in a system-wide script
+# would break for any other user.
+CONFIG_DIR="${HYPR_UTIL_CONFIG_DIR:?HYPR_UTIL_CONFIG_DIR is not set}"
 CURVES_DIR="$CONFIG_DIR/curves"
 OVERRIDE_FILE="$CONFIG_DIR/override"
 

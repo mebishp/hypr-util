@@ -8,7 +8,7 @@ SUBPROCESS_TIMEOUT = 3
 
 CURVES_DIR = CONFIG_DIR / "curves"
 OVERRIDE_FILE = CONFIG_DIR / "override"
-SERVICE = "fancurve.service"
+SERVICE = "hypr-util-fancurve.service"
 
 PROFILES = ["power-saver", "balanced", "performance"]
 PROFILE_LABELS = {"power-saver": "Eco", "balanced": "Balanced", "performance": "Performance"}

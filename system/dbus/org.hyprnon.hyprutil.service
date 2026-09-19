@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.hyprnon.hyprutil
+Exec=@BINDIR@/hyprutil app --gapplication-service

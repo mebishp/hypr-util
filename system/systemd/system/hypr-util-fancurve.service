@@ -1,0 +1,21 @@
+[Unit]
+Description=hypr-util multi-point fan curve for hp-wmi
+After=multi-user.target
+Conflicts=fancontrol.service
+# Stopped before suspend and restarted after resume by the
+# /etc/systemd/system-sleep/hypr-util hook, not by a unit-level sleep
+# dependency.
+
+[Service]
+Type=simple
+# This runs as root, but reads the curve/override files owned by the desktop
+# user who installed it -- setup.sh substitutes their config directory here
+# rather than the script hardcoding a home directory.
+Environment=HYPR_UTIL_CONFIG_DIR=@CONFIG_DIR@
+ExecStart=@BINDIR@/hypr-util-fancurve
+ExecStopPost=/bin/sh -c 'd=$(grep -l hp /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1 | xargs dirname); [ -n "$d" ] && echo 2 > "$d/pwm1_enable" || true'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

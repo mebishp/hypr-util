@@ -1,3 +1,0 @@
-[D-BUS Service]
-Name=org.hyprnon.hyprutil
-Exec=%REPO_DIR%/bin/hyprutil app --gapplication-service

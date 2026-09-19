@@ -45,13 +45,3 @@ def _revert():
 def flash_for_profile(profile, effect="breathe", duration=3.5, revert=None):
     color = PROFILE_FLASH_COLORS.get(profile, "ffffff")
     flash(effect, color, duration, revert=revert)
-
-
-# Same blue for both entering and exiting focus mode -- unlike profile
-# flashes there's no need to distinguish "which state", just "focus mode
-# changed", so one color covers both transitions.
-FOCUS_FLASH_COLOR = "0000ff"
-
-
-def flash_for_focus(effect="breathe", duration=3.5, revert=None):
-    flash(effect, FOCUS_FLASH_COLOR, duration, revert=revert)
