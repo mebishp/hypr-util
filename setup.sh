@@ -10,11 +10,15 @@
 #   $PREFIX/lib/hypr-util/hyprutil/     Python package
 #   $PREFIX/bin/hyprutil                launcher
 #   $PREFIX/bin/hypr-util-fancurve      fan curve daemon script
+#   /usr/src/hyprkbd-<version>/         keyboard lighting driver, built by DKMS
+#   /etc/modules-load.d/hyprkbd.conf    loads it at boot
 #   /etc/systemd/system/                hypr-util-fancurve.service
 #                                       hypr-util-kbd.service
 #   /etc/systemd/system-sleep/hypr-util suspend/resume hook
 #   /etc/udev/rules.d/                  99-firefly-keyboard.rules
+#                                       99-hyprkbd.rules
 #   ~/.config/systemd/user/             hypr-util-{daemon,tray}.service
+#                                       hypr-util-kbd-effects.service
 #   ~/.local/share/applications/        desktop entry
 #   ~/.local/share/dbus-1/services/     D-Bus activation file
 #   ~/.local/share/icons/hicolor/       app icon
@@ -30,8 +34,14 @@ CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}
 DATA_DIR=${XDG_DATA_HOME:-$HOME/.local/share}
 APP_CONFIG_DIR=$CONFIG_DIR/hypr-util
 
-USER_UNITS=(hypr-util-daemon.service hypr-util-tray.service)
+USER_UNITS=(hypr-util-daemon.service hypr-util-tray.service hypr-util-kbd-effects.service)
 SYSTEM_UNITS=(hypr-util-fancurve.service hypr-util-kbd.service)
+
+# The laptop keyboard lighting driver. Version comes from its own dkms.conf,
+# so bumping it in one place is enough.
+KMOD_NAME=hyprkbd
+KMOD_SRC=$REPO_DIR/kernel/hyprkbd
+KMOD_VERSION=$(sed -n 's/^PACKAGE_VERSION="\(.*\)"/\1/p' "$KMOD_SRC/dkms.conf")
 
 log() { printf '[setup] %s\n' "$*"; }
 die() { printf '[setup] error: %s\n' "$*" >&2; exit 1; }
@@ -45,6 +55,7 @@ render_install() {
 	sed -e "s|@BINDIR@|$BINDIR|g" \
 	    -e "s|@LIBDIR@|$LIBDIR|g" \
 	    -e "s|@CONFIG_DIR@|$APP_CONFIG_DIR|g" \
+	    -e "s|@OWNER@|$(id -u):$(id -g)|g" \
 	    "$src" | $sudo_cmd install -D -m "$mode" /dev/stdin "$dest"
 }
 
@@ -56,14 +67,15 @@ check_preconditions() {
 
 install_packages() {
 	if ! command -v pacman >/dev/null; then
-		log "pacman not found; install these manually if missing: python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon acpi_call"
+		log "pacman not found; install these manually if missing: python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon dkms, and your kernel's headers"
 		return
 	fi
-	# acpi_call is what carries the laptop keyboard's colours: the kernel's
-	# own hp-wmi driver speaks this BIOS mailbox but exposes nothing for
-	# lighting, and there is no other route to it from userspace. Everything
-	# else still works without it; only the Laptop page goes dark.
-	local pkgs=(python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon acpi_call)
+	# dkms builds the laptop keyboard lighting driver (kernel/hyprkbd), which
+	# is what carries the colours: the kernel's own hp-wmi driver speaks the
+	# same BIOS mailbox but has no lighting code, and nothing else reaches
+	# it. Everything else here still works without it; only the Laptop page
+	# goes dark.
+	local pkgs=(python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon dkms)
 	local missing=()
 	local pkg
 	for pkg in "${pkgs[@]}"; do
@@ -112,6 +124,54 @@ remove_legacy() {
 		"$DATA_DIR/icons/hicolor/scalable/apps/org.hyprnon.hyprutil-v2.svg"
 }
 
+# Build and install the laptop keyboard lighting driver through DKMS, so it
+# survives a kernel upgrade without anyone remembering it exists.
+#
+# Not fatal when it fails. Everything else in this project works on a machine
+# with no kernel headers or no HP mailbox; only the Laptop keyboard page
+# needs the driver, and it says so itself when the module is missing.
+install_kernel_module() {
+	local dest=/usr/src/$KMOD_NAME-$KMOD_VERSION
+
+	if ! command -v dkms >/dev/null; then
+		log "dkms not installed; skipping the keyboard lighting driver"
+		return
+	fi
+	if [ ! -d "/usr/lib/modules/$(uname -r)/build" ] && [ ! -d "/lib/modules/$(uname -r)/build" ]; then
+		log "no kernel headers for $(uname -r); skipping the keyboard lighting driver"
+		log "  install them (e.g. 'pacman -S linux-headers') and re-run ./setup.sh"
+		return
+	fi
+
+	# A previously loaded copy holds the sysfs attributes open; the new one
+	# cannot register the same platform device until it is gone.
+	sudo modprobe -r "$KMOD_NAME" 2>/dev/null || true
+	# Re-registering the same version is what a re-run after `git pull`
+	# does, and dkms refuses to overwrite one in place.
+	sudo dkms remove -m "$KMOD_NAME" -v "$KMOD_VERSION" --all 2>/dev/null || true
+
+	log "building $KMOD_NAME $KMOD_VERSION with dkms"
+	sudo rm -rf "$dest"
+	sudo install -d -m 755 "$dest"
+	sudo install -m 644 "$KMOD_SRC"/hyprkbd.c "$KMOD_SRC"/Makefile "$KMOD_SRC"/dkms.conf "$dest/"
+
+	if ! sudo dkms install -m "$KMOD_NAME" -v "$KMOD_VERSION"; then
+		log "the keyboard lighting driver did not build; the Laptop page will stay dark"
+		log "  see /var/lib/dkms/$KMOD_NAME/$KMOD_VERSION/build/make.log"
+		return
+	fi
+
+	sudo install -D -m 644 "$SRC/modules-load/hyprkbd.conf" /etc/modules-load.d/hyprkbd.conf
+	sudo modprobe "$KMOD_NAME" || log "the driver installed but would not load; check dmesg"
+
+	# A second driver writing the same firmware colour table fights this one
+	# for it. Worth saying out loud rather than leaving as a mystery.
+	if lsmod | grep -q '^hp_rgb_lighting'; then
+		log "warning: hp_rgb_lighting is also loaded and drives the same colour table"
+		log "  remove it with 'sudo modprobe -r hp_rgb_lighting' if the colours fight"
+	fi
+}
+
 install_program() {
 	log "installing program files into $PREFIX"
 	# Wipe the whole directory rather than just the package: it also used to
@@ -131,6 +191,8 @@ install_program() {
 install_system_units() {
 	log "installing system units and rules"
 	sudo install -D -m 644 "$SRC/udev/99-firefly-keyboard.rules" /etc/udev/rules.d/99-firefly-keyboard.rules
+	# Rendered, not copied: it carries the uid this install is for.
+	render_install 644 "$SRC/udev/99-hyprkbd.rules" /etc/udev/rules.d/99-hyprkbd.rules sudo
 	sudo install -D -m 755 "$SRC/sleep/hypr-util" /etc/systemd/system-sleep/hypr-util
 	local unit
 	for unit in "${SYSTEM_UNITS[@]}"; do
@@ -178,6 +240,7 @@ main() {
 	install_packages
 	stop_services
 	remove_legacy
+	install_kernel_module
 	install_program
 	install_system_units
 	install_user_files

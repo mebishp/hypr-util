@@ -24,11 +24,24 @@ log "stopping and disabling services"
 # --now so this both stops the running unit and clears its enablement; the
 # legacy names are included so a machine installed from an older layout is
 # fully cleaned up too.
-systemctl --user disable --now hypr-util-daemon.service hypr-util-tray.service 2>/dev/null || true
+systemctl --user disable --now hypr-util-daemon.service hypr-util-tray.service hypr-util-kbd-effects.service 2>/dev/null || true
 sudo systemctl disable --now hypr-util-fancurve.service hypr-util-kbd.service fancurve.service 2>/dev/null || true
 # The settings app is resident (hides rather than exits), so it survives
 # having its files deleted out from under it.
 pkill -f 'hyprutil app' 2>/dev/null || true
+
+# The keyboard lighting driver, before the files that describe it: unloading
+# first means nothing is holding the sysfs attributes when dkms tears the
+# module out from under them.
+log "removing the keyboard lighting driver"
+sudo modprobe -r hyprkbd 2>/dev/null || true
+if command -v dkms >/dev/null; then
+	# --all: every kernel it was built for, not just the running one.
+	for version in $(dkms status -m hyprkbd 2>/dev/null | sed -n 's|^hyprkbd/\([^,]*\),.*|\1|p' | sort -u); do
+		sudo dkms remove -m hyprkbd -v "$version" --all 2>/dev/null || true
+		sudo rm -rf "/usr/src/hyprkbd-$version"
+	done
+fi
 
 log "removing system files"
 sudo rm -rf "$LIBDIR"
@@ -39,6 +52,8 @@ sudo rm -f \
 	/etc/systemd/system/hypr-util-kbd.service \
 	/etc/systemd/system-sleep/hypr-util \
 	/etc/udev/rules.d/99-firefly-keyboard.rules \
+	/etc/udev/rules.d/99-hyprkbd.rules \
+	/etc/modules-load.d/hyprkbd.conf \
 	/etc/systemd/system/fancurve.service \
 	/usr/local/bin/fancurve.sh \
 	/usr/lib/systemd/system-sleep/hypr-util
@@ -47,6 +62,7 @@ log "removing user files"
 rm -f \
 	"$CONFIG_DIR/systemd/user/hypr-util-daemon.service" \
 	"$CONFIG_DIR/systemd/user/hypr-util-tray.service" \
+	"$CONFIG_DIR/systemd/user/hypr-util-kbd-effects.service" \
 	"$DATA_DIR/applications/org.hyprnon.hyprutil.desktop" \
 	"$DATA_DIR/dbus-1/services/org.hyprnon.hyprutil.service" \
 	"$DATA_DIR/icons/hicolor/scalable/apps/org.hyprnon.hyprutil.svg" \

@@ -172,9 +172,9 @@ class FanTray(QSystemTrayIcon):
         self._actions.append(brightness_menu)
 
         # The laptop's own keyboard, which is a different device from the
-        # Firefly above it: four zones behind the BIOS mailbox, driven by
-        # the root lighting service. Disabled until that service answers,
-        # so a click cannot silently do nothing.
+        # Firefly above it: four zones behind the BIOS mailbox, reached
+        # through the hyprkbd driver's sysfs files. Disabled until the
+        # driver answers, so a click cannot silently do nothing.
         self.kbd_menu = QMenu("Laptop Keyboard")
         self.kbd_menu.setEnabled(False)
         self.kbd_menu.addAction(
@@ -183,9 +183,21 @@ class FanTray(QSystemTrayIcon):
         self.kbd_menu.addAction(
             self._make_action("Backlight off", slot=lambda checked: self.set_kbd(on=False))
         )
+
+        # Presets before effects: a preset is a whole look someone chose and
+        # named, which is more often what they want from a tray than an
+        # effect applied over whatever colours happen to be set.
         self.kbd_menu.addSeparator()
+        presets_menu = self.kbd_menu.addMenu("Presets")
+        for slot, look in kbd.presets.read_all().items():
+            presets_menu.addAction(self._make_action(
+                look["name"],
+                slot=lambda checked, n=slot: self.apply_kbd_preset(n),
+            ))
+
+        effects_menu = self.kbd_menu.addMenu("Effects")
         for effect in kbd.EFFECTS:
-            self.kbd_menu.addAction(self._make_action(
+            effects_menu.addAction(self._make_action(
                 kbd.EFFECT_LABELS[effect],
                 slot=lambda checked, e=effect: self.set_kbd(effect=e),
             ))
@@ -288,6 +300,17 @@ class FanTray(QSystemTrayIcon):
         threading.Thread(
             target=self._set_kbd_worker, args=(on, effect), daemon=True
         ).start()
+
+    def apply_kbd_preset(self, slot):
+        threading.Thread(
+            target=self._kbd_preset_worker, args=(slot,), daemon=True
+        ).start()
+
+    def _kbd_preset_worker(self, slot):
+        try:
+            kbd.apply_preset(slot)
+        except Exception:
+            logger.exception("failed to apply laptop keyboard preset %r", slot)
 
     def _set_kbd_worker(self, on, effect):
         try:

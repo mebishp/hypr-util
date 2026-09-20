@@ -1,21 +1,22 @@
 [Unit]
-Description=hypr-util laptop keyboard lighting (HP four-zone, via the BIOS mailbox)
+Description=hypr-util laptop keyboard lighting (restore the saved look)
 After=multi-user.target
-# Restarted after resume by the /etc/systemd/system-sleep/hypr-util hook,
-# which is what puts the saved colours back on the keyboard.
+ConditionPathExists=/sys/devices/platform/hyprkbd
 
 [Service]
-Type=simple
-# This runs as root, because the ACPI mailbox that carries the colours is
-# root-only. It reads the look saved by the desktop user who installed it --
-# setup.sh substitutes their config directory here -- and hands the control
-# socket to that user, so the settings app can reach it without being root.
+# A oneshot, not a daemon. The hyprkbd driver does the privileged part, so
+# all that is left for root is putting the saved colours back on a keyboard
+# the firmware has just reset: at boot, before anyone has logged in, and
+# again on resume via /etc/systemd/system-sleep/hypr-util.
+#
+# The effects service that animates them runs in the desktop session
+# instead, as the user -- see hypr-util-kbd-effects.service.
+Type=oneshot
+RemainAfterExit=yes
+# Which user's saved look to restore. setup.sh substitutes the config
+# directory of whoever installed this, exactly as it does for the fan curve.
 Environment=HYPR_UTIL_CONFIG_DIR=@CONFIG_DIR@
-ExecStart=@BINDIR@/hyprutil kbd-daemon
-RuntimeDirectory=hypr-util
-RuntimeDirectoryMode=0755
-Restart=on-failure
-RestartSec=5
+ExecStart=@BINDIR@/hyprutil kbd reload
 
 [Install]
 WantedBy=multi-user.target

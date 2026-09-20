@@ -1,0 +1,20 @@
+[Unit]
+Description=hypr-util laptop keyboard effects (breathe, cycle, wave)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+# Runs as you, not as root: the hyprkbd driver's udev rule hands this user
+# the sysfs attributes that carry the colours. It applies the saved look on
+# start, then writes a frame about eight times a second for as long as an
+# animated effect is selected -- the firmware runs no animation of its own.
+#
+# A static look costs nothing here; the loop idles until the saved look
+# changes on disk.
+Type=simple
+ExecStart=@BINDIR@/hyprutil kbd-effects
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

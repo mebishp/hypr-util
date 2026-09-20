@@ -10,6 +10,16 @@ venv/
 # Rust
 target/
 
+# Out-of-tree kernel module build products
+*.ko
+*.o
+*.mod
+*.mod.c
+*.symvers
+*.order
+.tmp_versions/
+.*.cmd
+
 # Editors / OS
 .DS_Store
 *.swp

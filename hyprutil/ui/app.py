@@ -472,6 +472,384 @@ class RgbPage(Gtk.Box):
         self.connect("map", self._on_map)
         self.connect("unmap", self._on_unmap)
 
+
+    # -- presets --
+
+    def _build_presets(self, page):
+        """Four slots, each an editable name with Apply and Save beside it.
+
+        An entry row rather than a plain one so renaming a preset is where
+        you would look for it -- in the name -- instead of behind a menu.
+        """
+        group = Adw.PreferencesGroup(
+            title="Presets",
+            description="Save a whole look -- effect, colours, brightness and speed",
+        )
+        page.add(group)
+        self._preset_rows = {}
+        for slot in kbd_backend.presets.PRESET_SLOTS:
+            stored = kbd_backend.presets.read(slot)
+            row = Adw.EntryRow(title=f"Slot {slot}")
+            row.set_text(stored["name"])
+            row.connect("apply", self._on_preset_renamed, slot)
+            row.set_show_apply_button(True)
+
+            apply_btn = Gtk.Button(
+                icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER,
+                tooltip_text="Put this preset on the keyboard",
+            )
+            apply_btn.add_css_class("flat")
+            apply_btn.connect("clicked", self._on_preset_apply, slot)
+            row.add_suffix(apply_btn)
+
+            save_btn = Gtk.Button(
+                icon_name="document-save-symbolic", valign=Gtk.Align.CENTER,
+                tooltip_text="Save the current look into this slot",
+            )
+            save_btn.add_css_class("flat")
+            save_btn.connect("clicked", self._on_preset_save, slot)
+            row.add_suffix(save_btn)
+
+            group.add(row)
+            self._preset_rows[slot] = row
+        self.presets_group = group
+
+    def _on_preset_apply(self, _button, slot):
+        self._busy = True
+        threading.Thread(
+            target=self._preset_apply_worker, args=(slot,), daemon=True
+        ).start()
+
+    def _preset_apply_worker(self, slot):
+        error = None
+        try:
+            kbd_backend.apply_preset(slot)
+        except Exception as e:
+            error = str(e)
+        GLib.idle_add(self._after_preset_apply, slot, error)
+
+    def _after_preset_apply(self, slot, error):
+        self._busy = False
+        if error:
+            self._show_toast(error)
+            return False
+        # Adopt what was just applied, so the controls and the preview show
+        # the preset rather than the look it replaced.
+        self._look = kbd_backend.read_current()
+        self._phase = 0.0
+        self._load_look_into_controls()
+        self.preview.set_look(self._look, self._zones, self._phase, self._settings)
+        self._show_toast(f"Applied {kbd_backend.presets.read(slot)['name']}")
+        return False
+
+    def _on_preset_save(self, _button, slot):
+        name = self._preset_rows[slot].get_text().strip() or None
+        try:
+            stored = kbd_backend.save_preset(slot, self._look, name=name)
+        except Exception as e:
+            self._show_toast(str(e))
+            return
+        self._preset_rows[slot].set_text(stored["name"])
+        self._show_toast(f"Saved into {stored['name']}")
+
+    def _on_preset_renamed(self, row, slot):
+        name = row.get_text().strip()
+        if not name:
+            row.set_text(kbd_backend.presets.read(slot)["name"])
+            return
+        kbd_backend.presets.rename(slot, name)
+
+    # -- indicators --
+
+    def _make_zone_combo(self, title, subtitle, handler):
+        row = Adw.ComboRow(title=title, subtitle=subtitle)
+        row.set_model(Gtk.StringList.new(
+            [kbd_backend.ZONE_NAMES[z] for z in kbd_backend.DISPLAY_ORDER]
+        ))
+        row.connect("notify::selected", handler)
+        return row
+
+    def _zone_from_combo(self, row):
+        return kbd_backend.DISPLAY_ORDER[row.get_selected()]
+
+    def _combo_index_for_zone(self, zone):
+        try:
+            return kbd_backend.DISPLAY_ORDER.index(zone)
+        except ValueError:
+            return 0
+
+    def _build_indicators(self, page):
+        group = Adw.PreferencesGroup(
+            title="Indicators",
+            description=(
+                "One zone held aside to show the machine's state. These keep "
+                "working with the lighting switched off -- the rest of the "
+                "board goes dark and the indicator stays lit."
+            ),
+        )
+        page.add(group)
+
+        self.ind_enabled_row = Adw.SwitchRow(title="Show indicators")
+        self.ind_enabled_row.connect("notify::active", self._on_indicator_toggle)
+        group.add(self.ind_enabled_row)
+
+        self.ind_when_off_row = Adw.SwitchRow(
+            title="Keep showing when the lighting is off",
+            subtitle="The backlight stays on for the indicator alone",
+        )
+        self.ind_when_off_row.connect("notify::active", self._on_indicator_toggle)
+        group.add(self.ind_when_off_row)
+
+        self.ind_profile_row = Adw.SwitchRow(
+            title="Power profile",
+            subtitle="Green saver, yellow balanced, red performance",
+        )
+        self.ind_profile_row.connect("notify::active", self._on_indicator_toggle)
+        group.add(self.ind_profile_row)
+
+        self.ind_profile_zone = self._make_zone_combo(
+            "Profile zone", "Where to show it", self._on_indicator_toggle
+        )
+        group.add(self.ind_profile_zone)
+
+        self.ind_battery_row = Adw.SwitchRow(
+            title="Battery",
+            subtitle="Amber when low, blinking red when critical, pulsing green while charging",
+        )
+        self.ind_battery_row.connect("notify::active", self._on_indicator_toggle)
+        group.add(self.ind_battery_row)
+
+        self.ind_battery_zone = self._make_zone_combo(
+            "Battery zone", "Where to show it", self._on_indicator_toggle
+        )
+        group.add(self.ind_battery_zone)
+
+        self.ind_low_row = Adw.SpinRow.new_with_range(1, 100, 1)
+        self.ind_low_row.set_title("Low battery at")
+        self.ind_low_row.set_subtitle("percent")
+        self.ind_low_row.connect("notify::value", self._on_indicator_toggle)
+        group.add(self.ind_low_row)
+
+        self.ind_critical_row = Adw.SpinRow.new_with_range(1, 100, 1)
+        self.ind_critical_row.set_title("Critical at")
+        self.ind_critical_row.set_subtitle("percent")
+        self.ind_critical_row.connect("notify::value", self._on_indicator_toggle)
+        group.add(self.ind_critical_row)
+
+        self.ind_status_row = Adw.ActionRow(
+            title="Showing now", subtitle="nothing"
+        )
+        group.add(self.ind_status_row)
+        self.indicators_group = group
+
+    def _on_indicator_toggle(self, *_):
+        if self._loading_settings:
+            return
+        low = int(self.ind_low_row.get_value())
+        critical = int(self.ind_critical_row.get_value())
+        self._push_settings({"indicators": {
+            "enabled": self.ind_enabled_row.get_active(),
+            "when_off": self.ind_when_off_row.get_active(),
+            "profile": {
+                "enabled": self.ind_profile_row.get_active(),
+                "zone": self._zone_from_combo(self.ind_profile_zone),
+            },
+            "battery": {
+                "enabled": self.ind_battery_row.get_active(),
+                "zone": self._zone_from_combo(self.ind_battery_zone),
+                "low": low,
+                "critical": critical,
+            },
+        }})
+
+    # -- battery saver --
+
+    def _build_saver(self, page):
+        group = Adw.PreferencesGroup(
+            title="Battery saver",
+            description=(
+                "Four lit zones are a real draw. On battery the colours are "
+                "scaled back without touching the look you chose -- plug in "
+                "and it returns exactly as it was."
+            ),
+        )
+        page.add(group)
+
+        self.saver_row = Adw.SwitchRow(title="Dim on battery")
+        self.saver_row.connect("notify::active", self._on_saver_changed)
+        group.add(self.saver_row)
+
+        self.saver_brightness_row, self.saver_brightness_scale = self._make_slider(
+            "Brightness cap", 0, kbd_backend.BRIGHTNESS_MAX, self._on_saver_changed
+        )
+        group.add(self.saver_brightness_row)
+
+        self.saver_static_row = Adw.SwitchRow(
+            title="Stop animations on battery",
+            subtitle="The cost of an effect is the writes, not the brightness",
+        )
+        self.saver_static_row.connect("notify::active", self._on_saver_changed)
+        group.add(self.saver_static_row)
+        self.saver_group = group
+
+    def _on_saver_changed(self, *_):
+        if self._loading_settings:
+            return
+        self._push_settings({"battery_saver": {
+            "enabled": self.saver_row.get_active(),
+            "brightness": int(self.saver_brightness_scale.get_value()),
+            "static_only": self.saver_static_row.get_active(),
+        }})
+
+    # -- matching the other keyboard --
+
+    def _build_match(self, page):
+        group = Adw.PreferencesGroup(
+            title="Match the Firefly",
+            description=(
+                "Send this keyboard's colour to the external Firefly so the "
+                "two agree. Their effects were designed for different "
+                "hardware, so translating those is a separate choice."
+            ),
+        )
+        page.add(group)
+
+        self.match_row = Adw.SwitchRow(title="Follow this keyboard")
+        self.match_row.connect("notify::active", self._on_match_changed)
+        group.add(self.match_row)
+
+        self.match_zone = self._make_zone_combo(
+            "Take the colour from", "Which zone the Firefly copies",
+            self._on_match_changed,
+        )
+        group.add(self.match_zone)
+
+        self.match_effect_row = Adw.SwitchRow(
+            title="Translate the effect too",
+            subtitle="Off: only the colour follows",
+        )
+        self.match_effect_row.connect("notify::active", self._on_match_changed)
+        group.add(self.match_effect_row)
+
+        now_row = Adw.ActionRow(
+            title="Match now", subtitle="Send one match without switching this on"
+        )
+        button = Gtk.Button(label="Match", valign=Gtk.Align.CENTER)
+        button.connect("clicked", self._on_match_now)
+        now_row.add_suffix(button)
+        now_row.set_activatable_widget(button)
+        group.add(now_row)
+        self.match_group = group
+
+    def _on_match_changed(self, *_):
+        if self._loading_settings:
+            return
+        self._push_settings({"sync": {
+            "enabled": self.match_row.get_active(),
+            "source_zone": self._zone_from_combo(self.match_zone),
+            "match_effect": self.match_effect_row.get_active(),
+        }})
+
+    def _on_match_now(self, *_):
+        threading.Thread(target=self._match_now_worker, daemon=True).start()
+
+    def _match_now_worker(self):
+        try:
+            sent = kbd_backend.match_firefly(self._look)
+        except Exception as e:
+            GLib.idle_add(self._show_toast, str(e))
+            return
+        GLib.idle_add(
+            self._show_toast,
+            f"Sent #{sent['color']} to the Firefly" if sent
+            else "The Firefly is not connected",
+        )
+
+    # -- settings plumbing --
+
+    def _push_settings(self, patch):
+        """Save a settings change and put it on the keyboard.
+
+        Applied to the local copy first so the preview updates on the same
+        frame, rather than a beat later when the worker comes back.
+        """
+        def merge(into, changes):
+            for key, value in changes.items():
+                if isinstance(value, dict) and isinstance(into.get(key), dict):
+                    merge(into[key], value)
+                else:
+                    into[key] = value
+
+        merge(self._settings, patch)
+        self.preview.set_look(self._look, self._zones, self._phase, self._settings)
+        threading.Thread(
+            target=self._settings_worker, args=(patch,), daemon=True
+        ).start()
+
+    def _settings_worker(self, patch):
+        try:
+            saved = kbd_backend.update_settings(patch)
+        except Exception as e:
+            GLib.idle_add(self._show_toast, str(e))
+            return
+        GLib.idle_add(self._adopt_settings, saved)
+
+    def _adopt_settings(self, saved):
+        # Adopted back from the file because normalize() clamps -- a critical
+        # threshold typed above the low one comes back corrected, and the
+        # spin button should show the corrected number.
+        self._settings = saved
+        self._load_settings_into_controls()
+        return False
+
+    def _load_settings_into_controls(self):
+        config = self._settings
+        self._loading_settings = True
+        indicators = config["indicators"]
+        self.ind_enabled_row.set_active(indicators["enabled"])
+        self.ind_when_off_row.set_active(indicators["when_off"])
+        self.ind_profile_row.set_active(indicators["profile"]["enabled"])
+        self.ind_profile_zone.set_selected(
+            self._combo_index_for_zone(indicators["profile"]["zone"])
+        )
+        battery = indicators["battery"]
+        self.ind_battery_row.set_active(battery["enabled"])
+        self.ind_battery_zone.set_selected(self._combo_index_for_zone(battery["zone"]))
+        self.ind_low_row.set_value(battery["low"])
+        self.ind_critical_row.set_value(battery["critical"])
+
+        saver = config["battery_saver"]
+        self.saver_row.set_active(saver["enabled"])
+        self.saver_brightness_scale.set_value(saver["brightness"])
+        self.saver_static_row.set_active(saver["static_only"])
+
+        sync = config["sync"]
+        self.match_row.set_active(sync["enabled"])
+        self.match_zone.set_selected(self._combo_index_for_zone(sync["source_zone"]))
+        self.match_effect_row.set_active(sync["match_effect"])
+        self._loading_settings = False
+        self._sync_settings_sensitivity()
+
+    def _sync_settings_sensitivity(self):
+        """Grey out what a switched-off section cannot use."""
+        indicators = self._settings["indicators"]
+        on = indicators["enabled"]
+        for widget in (self.ind_when_off_row, self.ind_profile_row,
+                       self.ind_battery_row, self.ind_status_row):
+            widget.set_sensitive(on)
+        self.ind_profile_zone.set_sensitive(on and indicators["profile"]["enabled"])
+        battery_on = on and indicators["battery"]["enabled"]
+        for widget in (self.ind_battery_zone, self.ind_low_row, self.ind_critical_row):
+            widget.set_sensitive(battery_on)
+
+        saver_on = self._settings["battery_saver"]["enabled"]
+        self.saver_brightness_row.set_sensitive(saver_on)
+        self.saver_static_row.set_sensitive(saver_on)
+
+        match_on = self._settings["sync"]["enabled"]
+        self.match_zone.set_sensitive(match_on)
+        self.match_effect_row.set_sensitive(match_on)
+
     # -- small builders --
 
     def _make_slider(self, title, lower, upper, handler):
@@ -775,11 +1153,14 @@ class LaptopKbdPage(Gtk.Box):
     """The laptop's own keyboard: four zones, driven through the BIOS.
 
     A different keyboard from the RGB page's, with a different set of
-    honest limits. There are four zones and no more, the firmware runs no
-    animations of its own (so an effect is this app writing frames), and
-    everything needs the root service, because the mailbox that carries the
-    colours is root-only. When that service is missing the page says so and
-    says what to run, rather than showing controls that do nothing.
+    honest limits. There are four zones and no more, and the firmware runs
+    no animations of its own -- so an effect is frames, written here while
+    the page is open and by the effects service once it is closed.
+
+    Reaching the hardware is a sysfs write, handed to this user by the
+    hyprkbd driver's udev rule. When the driver is missing, or the board is
+    a per-key one the firmware will not drive, the page says which and says
+    what to run, rather than showing controls that do nothing.
     """
 
     APPLY_DEBOUNCE_MS = 200
@@ -792,7 +1173,7 @@ class LaptopKbdPage(Gtk.Box):
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         self.toast_overlay.set_child(content)
 
-        self.banner = Adw.Banner(title="Keyboard lighting service not available")
+        self.banner = Adw.Banner(title="Keyboard lighting not available")
         content.append(self.banner)
 
         scroller = Gtk.ScrolledWindow(vexpand=True)
@@ -801,6 +1182,9 @@ class LaptopKbdPage(Gtk.Box):
         content.append(scroller)
 
         self._look = kbd_backend.read_current()
+        self._settings = kbd_backend.read_settings()
+        self._indicators_animated = False
+        self._loading_settings = False
         self._zones = 4
         self._loading = False
         self._apply_timer_id = None
@@ -869,9 +1253,393 @@ class LaptopKbdPage(Gtk.Box):
         factory.connect("clicked", self._on_factory_clicked)
         self.zones_group.add(factory)
 
+        self._build_presets(page)
+        self._build_indicators(page)
+        self._build_saver(page)
+        self._build_match(page)
+
         self._load_look_into_controls()
+        self._load_settings_into_controls()
         self.connect("map", self._on_map)
         self.connect("unmap", self._on_unmap)
+
+
+    # -- presets --
+
+    def _build_presets(self, page):
+        """Four slots, each an editable name with Apply and Save beside it.
+
+        An entry row rather than a plain one so renaming a preset is where
+        you would look for it -- in the name -- instead of behind a menu.
+        """
+        group = Adw.PreferencesGroup(
+            title="Presets",
+            description="Save a whole look -- effect, colours, brightness and speed",
+        )
+        page.add(group)
+        self._preset_rows = {}
+        for slot in kbd_backend.presets.PRESET_SLOTS:
+            stored = kbd_backend.presets.read(slot)
+            row = Adw.EntryRow(title=f"Slot {slot}")
+            row.set_text(stored["name"])
+            row.connect("apply", self._on_preset_renamed, slot)
+            row.set_show_apply_button(True)
+
+            apply_btn = Gtk.Button(
+                icon_name="media-playback-start-symbolic", valign=Gtk.Align.CENTER,
+                tooltip_text="Put this preset on the keyboard",
+            )
+            apply_btn.add_css_class("flat")
+            apply_btn.connect("clicked", self._on_preset_apply, slot)
+            row.add_suffix(apply_btn)
+
+            save_btn = Gtk.Button(
+                icon_name="document-save-symbolic", valign=Gtk.Align.CENTER,
+                tooltip_text="Save the current look into this slot",
+            )
+            save_btn.add_css_class("flat")
+            save_btn.connect("clicked", self._on_preset_save, slot)
+            row.add_suffix(save_btn)
+
+            group.add(row)
+            self._preset_rows[slot] = row
+        self.presets_group = group
+
+    def _on_preset_apply(self, _button, slot):
+        self._busy = True
+        threading.Thread(
+            target=self._preset_apply_worker, args=(slot,), daemon=True
+        ).start()
+
+    def _preset_apply_worker(self, slot):
+        error = None
+        try:
+            kbd_backend.apply_preset(slot)
+        except Exception as e:
+            error = str(e)
+        GLib.idle_add(self._after_preset_apply, slot, error)
+
+    def _after_preset_apply(self, slot, error):
+        self._busy = False
+        if error:
+            self._show_toast(error)
+            return False
+        # Adopt what was just applied, so the controls and the preview show
+        # the preset rather than the look it replaced.
+        self._look = kbd_backend.read_current()
+        self._phase = 0.0
+        self._load_look_into_controls()
+        self.preview.set_look(self._look, self._zones, self._phase, self._settings)
+        self._show_toast(f"Applied {kbd_backend.presets.read(slot)['name']}")
+        return False
+
+    def _on_preset_save(self, _button, slot):
+        name = self._preset_rows[slot].get_text().strip() or None
+        try:
+            stored = kbd_backend.save_preset(slot, self._look, name=name)
+        except Exception as e:
+            self._show_toast(str(e))
+            return
+        self._preset_rows[slot].set_text(stored["name"])
+        self._show_toast(f"Saved into {stored['name']}")
+
+    def _on_preset_renamed(self, row, slot):
+        name = row.get_text().strip()
+        if not name:
+            row.set_text(kbd_backend.presets.read(slot)["name"])
+            return
+        kbd_backend.presets.rename(slot, name)
+
+    # -- indicators --
+
+    def _make_zone_combo(self, title, subtitle, handler):
+        row = Adw.ComboRow(title=title, subtitle=subtitle)
+        row.set_model(Gtk.StringList.new(
+            [kbd_backend.ZONE_NAMES[z] for z in kbd_backend.DISPLAY_ORDER]
+        ))
+        row.connect("notify::selected", handler)
+        return row
+
+    def _zone_from_combo(self, row):
+        return kbd_backend.DISPLAY_ORDER[row.get_selected()]
+
+    def _combo_index_for_zone(self, zone):
+        try:
+            return kbd_backend.DISPLAY_ORDER.index(zone)
+        except ValueError:
+            return 0
+
+    def _build_indicators(self, page):
+        group = Adw.PreferencesGroup(
+            title="Indicators",
+            description=(
+                "One zone held aside to show the machine's state. These keep "
+                "working with the lighting switched off -- the rest of the "
+                "board goes dark and the indicator stays lit."
+            ),
+        )
+        page.add(group)
+
+        self.ind_enabled_row = Adw.SwitchRow(title="Show indicators")
+        self.ind_enabled_row.connect("notify::active", self._on_indicator_toggle)
+        group.add(self.ind_enabled_row)
+
+        self.ind_when_off_row = Adw.SwitchRow(
+            title="Keep showing when the lighting is off",
+            subtitle="The backlight stays on for the indicator alone",
+        )
+        self.ind_when_off_row.connect("notify::active", self._on_indicator_toggle)
+        group.add(self.ind_when_off_row)
+
+        self.ind_profile_row = Adw.SwitchRow(
+            title="Power profile",
+            subtitle="Green saver, yellow balanced, red performance",
+        )
+        self.ind_profile_row.connect("notify::active", self._on_indicator_toggle)
+        group.add(self.ind_profile_row)
+
+        self.ind_profile_zone = self._make_zone_combo(
+            "Profile zone", "Where to show it", self._on_indicator_toggle
+        )
+        group.add(self.ind_profile_zone)
+
+        self.ind_battery_row = Adw.SwitchRow(
+            title="Battery",
+            subtitle="Amber when low, blinking red when critical, pulsing green while charging",
+        )
+        self.ind_battery_row.connect("notify::active", self._on_indicator_toggle)
+        group.add(self.ind_battery_row)
+
+        self.ind_battery_zone = self._make_zone_combo(
+            "Battery zone", "Where to show it", self._on_indicator_toggle
+        )
+        group.add(self.ind_battery_zone)
+
+        self.ind_low_row = Adw.SpinRow.new_with_range(1, 100, 1)
+        self.ind_low_row.set_title("Low battery at")
+        self.ind_low_row.set_subtitle("percent")
+        self.ind_low_row.connect("notify::value", self._on_indicator_toggle)
+        group.add(self.ind_low_row)
+
+        self.ind_critical_row = Adw.SpinRow.new_with_range(1, 100, 1)
+        self.ind_critical_row.set_title("Critical at")
+        self.ind_critical_row.set_subtitle("percent")
+        self.ind_critical_row.connect("notify::value", self._on_indicator_toggle)
+        group.add(self.ind_critical_row)
+
+        self.ind_status_row = Adw.ActionRow(
+            title="Showing now", subtitle="nothing"
+        )
+        group.add(self.ind_status_row)
+        self.indicators_group = group
+
+    def _on_indicator_toggle(self, *_):
+        if self._loading_settings:
+            return
+        low = int(self.ind_low_row.get_value())
+        critical = int(self.ind_critical_row.get_value())
+        self._push_settings({"indicators": {
+            "enabled": self.ind_enabled_row.get_active(),
+            "when_off": self.ind_when_off_row.get_active(),
+            "profile": {
+                "enabled": self.ind_profile_row.get_active(),
+                "zone": self._zone_from_combo(self.ind_profile_zone),
+            },
+            "battery": {
+                "enabled": self.ind_battery_row.get_active(),
+                "zone": self._zone_from_combo(self.ind_battery_zone),
+                "low": low,
+                "critical": critical,
+            },
+        }})
+
+    # -- battery saver --
+
+    def _build_saver(self, page):
+        group = Adw.PreferencesGroup(
+            title="Battery saver",
+            description=(
+                "Four lit zones are a real draw. On battery the colours are "
+                "scaled back without touching the look you chose -- plug in "
+                "and it returns exactly as it was."
+            ),
+        )
+        page.add(group)
+
+        self.saver_row = Adw.SwitchRow(title="Dim on battery")
+        self.saver_row.connect("notify::active", self._on_saver_changed)
+        group.add(self.saver_row)
+
+        self.saver_brightness_row, self.saver_brightness_scale = self._make_slider(
+            "Brightness cap", 0, kbd_backend.BRIGHTNESS_MAX, self._on_saver_changed
+        )
+        group.add(self.saver_brightness_row)
+
+        self.saver_static_row = Adw.SwitchRow(
+            title="Stop animations on battery",
+            subtitle="The cost of an effect is the writes, not the brightness",
+        )
+        self.saver_static_row.connect("notify::active", self._on_saver_changed)
+        group.add(self.saver_static_row)
+        self.saver_group = group
+
+    def _on_saver_changed(self, *_):
+        if self._loading_settings:
+            return
+        self._push_settings({"battery_saver": {
+            "enabled": self.saver_row.get_active(),
+            "brightness": int(self.saver_brightness_scale.get_value()),
+            "static_only": self.saver_static_row.get_active(),
+        }})
+
+    # -- matching the other keyboard --
+
+    def _build_match(self, page):
+        group = Adw.PreferencesGroup(
+            title="Match the Firefly",
+            description=(
+                "Send this keyboard's colour to the external Firefly so the "
+                "two agree. Their effects were designed for different "
+                "hardware, so translating those is a separate choice."
+            ),
+        )
+        page.add(group)
+
+        self.match_row = Adw.SwitchRow(title="Follow this keyboard")
+        self.match_row.connect("notify::active", self._on_match_changed)
+        group.add(self.match_row)
+
+        self.match_zone = self._make_zone_combo(
+            "Take the colour from", "Which zone the Firefly copies",
+            self._on_match_changed,
+        )
+        group.add(self.match_zone)
+
+        self.match_effect_row = Adw.SwitchRow(
+            title="Translate the effect too",
+            subtitle="Off: only the colour follows",
+        )
+        self.match_effect_row.connect("notify::active", self._on_match_changed)
+        group.add(self.match_effect_row)
+
+        now_row = Adw.ActionRow(
+            title="Match now", subtitle="Send one match without switching this on"
+        )
+        button = Gtk.Button(label="Match", valign=Gtk.Align.CENTER)
+        button.connect("clicked", self._on_match_now)
+        now_row.add_suffix(button)
+        now_row.set_activatable_widget(button)
+        group.add(now_row)
+        self.match_group = group
+
+    def _on_match_changed(self, *_):
+        if self._loading_settings:
+            return
+        self._push_settings({"sync": {
+            "enabled": self.match_row.get_active(),
+            "source_zone": self._zone_from_combo(self.match_zone),
+            "match_effect": self.match_effect_row.get_active(),
+        }})
+
+    def _on_match_now(self, *_):
+        threading.Thread(target=self._match_now_worker, daemon=True).start()
+
+    def _match_now_worker(self):
+        try:
+            sent = kbd_backend.match_firefly(self._look)
+        except Exception as e:
+            GLib.idle_add(self._show_toast, str(e))
+            return
+        GLib.idle_add(
+            self._show_toast,
+            f"Sent #{sent['color']} to the Firefly" if sent
+            else "The Firefly is not connected",
+        )
+
+    # -- settings plumbing --
+
+    def _push_settings(self, patch):
+        """Save a settings change and put it on the keyboard.
+
+        Applied to the local copy first so the preview updates on the same
+        frame, rather than a beat later when the worker comes back.
+        """
+        def merge(into, changes):
+            for key, value in changes.items():
+                if isinstance(value, dict) and isinstance(into.get(key), dict):
+                    merge(into[key], value)
+                else:
+                    into[key] = value
+
+        merge(self._settings, patch)
+        self.preview.set_look(self._look, self._zones, self._phase, self._settings)
+        threading.Thread(
+            target=self._settings_worker, args=(patch,), daemon=True
+        ).start()
+
+    def _settings_worker(self, patch):
+        try:
+            saved = kbd_backend.update_settings(patch)
+        except Exception as e:
+            GLib.idle_add(self._show_toast, str(e))
+            return
+        GLib.idle_add(self._adopt_settings, saved)
+
+    def _adopt_settings(self, saved):
+        # Adopted back from the file because normalize() clamps -- a critical
+        # threshold typed above the low one comes back corrected, and the
+        # spin button should show the corrected number.
+        self._settings = saved
+        self._load_settings_into_controls()
+        return False
+
+    def _load_settings_into_controls(self):
+        config = self._settings
+        self._loading_settings = True
+        indicators = config["indicators"]
+        self.ind_enabled_row.set_active(indicators["enabled"])
+        self.ind_when_off_row.set_active(indicators["when_off"])
+        self.ind_profile_row.set_active(indicators["profile"]["enabled"])
+        self.ind_profile_zone.set_selected(
+            self._combo_index_for_zone(indicators["profile"]["zone"])
+        )
+        battery = indicators["battery"]
+        self.ind_battery_row.set_active(battery["enabled"])
+        self.ind_battery_zone.set_selected(self._combo_index_for_zone(battery["zone"]))
+        self.ind_low_row.set_value(battery["low"])
+        self.ind_critical_row.set_value(battery["critical"])
+
+        saver = config["battery_saver"]
+        self.saver_row.set_active(saver["enabled"])
+        self.saver_brightness_scale.set_value(saver["brightness"])
+        self.saver_static_row.set_active(saver["static_only"])
+
+        sync = config["sync"]
+        self.match_row.set_active(sync["enabled"])
+        self.match_zone.set_selected(self._combo_index_for_zone(sync["source_zone"]))
+        self.match_effect_row.set_active(sync["match_effect"])
+        self._loading_settings = False
+        self._sync_settings_sensitivity()
+
+    def _sync_settings_sensitivity(self):
+        """Grey out what a switched-off section cannot use."""
+        indicators = self._settings["indicators"]
+        on = indicators["enabled"]
+        for widget in (self.ind_when_off_row, self.ind_profile_row,
+                       self.ind_battery_row, self.ind_status_row):
+            widget.set_sensitive(on)
+        self.ind_profile_zone.set_sensitive(on and indicators["profile"]["enabled"])
+        battery_on = on and indicators["battery"]["enabled"]
+        for widget in (self.ind_battery_zone, self.ind_low_row, self.ind_critical_row):
+            widget.set_sensitive(battery_on)
+
+        saver_on = self._settings["battery_saver"]["enabled"]
+        self.saver_brightness_row.set_sensitive(saver_on)
+        self.saver_static_row.set_sensitive(saver_on)
+
+        match_on = self._settings["sync"]["enabled"]
+        self.match_zone.set_sensitive(match_on)
+        self.match_effect_row.set_sensitive(match_on)
 
     # -- small builders --
 
@@ -916,10 +1684,7 @@ class LaptopKbdPage(Gtk.Box):
         keyboard = reply.get("keyboard") or {}
         usable = bool(keyboard.get("usable"))
         if reply.get("unreachable"):
-            self.banner.set_title(
-                "Lighting service not running — start it with "
-                "sudo systemctl start hypr-util-kbd.service"
-            )
+            self.banner.set_title(reply.get("error") or "Keyboard lighting unavailable")
         elif not keyboard:
             self.banner.set_title(reply.get("error") or "No controllable keyboard lighting")
         elif not usable:
@@ -932,6 +1697,23 @@ class LaptopKbdPage(Gtk.Box):
             )
         self.banner.set_revealed(not usable)
         self.set_sensitive_controls(usable)
+
+        shown = reply.get("indicators") or []
+        self.ind_status_row.set_subtitle(
+            ", ".join(item["label"] for item in shown) or "nothing"
+        )
+        # The preview has to keep ticking for a blinking or pulsing
+        # indicator even when the look itself is static or switched off.
+        self._indicators_animated = any(
+            item["style"] != "solid" for item in shown
+        )
+        if reply.get("settings"):
+            self._settings = reply["settings"]
+        if reply.get("saving"):
+            self.saver_row.set_subtitle("Active now -- running on battery")
+        else:
+            self.saver_row.set_subtitle("")
+
         if usable:
             self._zones = int(keyboard.get("zones") or 4)
             look = reply.get("look")
@@ -942,8 +1724,12 @@ class LaptopKbdPage(Gtk.Box):
 
     def set_sensitive_controls(self, sensitive):
         for widget in (self.on_row, self.effect_row, self.brightness_row,
-                       self.speed_row, self.zones_group):
+                       self.speed_row, self.zones_group, self.presets_group,
+                       self.indicators_group, self.saver_group, self.match_group):
             widget.set_sensitive(sensitive)
+        if sensitive:
+            # Re-apply the finer rules the blanket enable above just undid.
+            self._sync_settings_sensitivity()
 
     # -- controls <-> look --
 
@@ -958,14 +1744,25 @@ class LaptopKbdPage(Gtk.Box):
             button.set_rgba(_hex_to_rgba(look["colors"][zone]))
         self._loading = False
         self._sync_control_visibility()
+        self._sync_effect_subtitle()
+
+    def _sync_effect_subtitle(self):
+        """Say what the chosen effect does, under the picker.
+
+        Ten effects is more than a name can carry on its own -- "sweep" and
+        "pulse" mean nothing until you have seen them.
+        """
+        self.effect_row.set_subtitle(
+            kbd_backend.EFFECT_DESCRIPTIONS.get(self._look["effect"], "")
+        )
 
     def _sync_control_visibility(self):
         """Show only what this look can use."""
         animated = self._look["effect"] in kbd_backend.ANIMATED
         self.speed_row.set_visible(animated)
-        # Cycle and wave run the whole spectrum and never read the zone
+        # Several effects paint their own hues and never read the zone
         # colours, so the pickers would be lying if they stayed live.
-        picks_colors = self._look["effect"] in ("static", "breathe")
+        picks_colors = self._look["effect"] not in kbd_backend.COLOURLESS_EFFECTS
         self.zones_group.set_visible(picks_colors)
         for zone, (row, _button) in self._zone_rows.items():
             row.set_visible(zone < self._zones or self._zones == 1)
@@ -982,6 +1779,7 @@ class LaptopKbdPage(Gtk.Box):
         self._look["effect"] = kbd_backend.EFFECTS[row.get_selected()]
         self._phase = 0.0
         self._sync_control_visibility()
+        self._sync_effect_subtitle()
         self._look_changed()
 
     def _on_brightness_changed(self, scale):
@@ -1025,7 +1823,7 @@ class LaptopKbdPage(Gtk.Box):
         self._look_changed()
 
     def _look_changed(self):
-        self.preview.set_look(self._look, self._zones, self._phase)
+        self.preview.set_look(self._look, self._zones, self._phase, self._settings)
         self._schedule_apply()
 
     # -- applying --
@@ -1069,11 +1867,15 @@ class LaptopKbdPage(Gtk.Box):
         """Run the drawn keyboard from the same frame function the daemon
         writes to the hardware, so the preview is the effect rather than an
         impression of it."""
-        if self._look["on"] and self._look["effect"] in kbd_backend.ANIMATED:
+        # A blinking indicator has to keep moving even with the lighting off,
+        # which is exactly the state the old condition called "nothing to
+        # animate".
+        animated = self._look["on"] and self._look["effect"] in kbd_backend.ANIMATED
+        if animated or self._indicators_animated:
             self._phase += kbd_backend.zones.PHASE_STEP * kbd_backend.zones.SPEED_FACTORS[
                 self._look["speed"]
             ]
-        self.preview.set_look(self._look, self._zones, self._phase)
+        self.preview.set_look(self._look, self._zones, self._phase, self._settings)
         return True
 
 
@@ -1089,9 +1891,12 @@ class _ZonePreview(Gtk.DrawingArea):
         self.set_hexpand(True)
         self.set_draw_func(self._draw)
 
-    def set_look(self, look, zones, phase):
-        self._colors = kbd_backend.frame_colors(look, zones, phase)
-        self._on = look["on"]
+    def set_look(self, look, zones, phase, config=None):
+        # The composed frame, not the raw look: the preview has to show the
+        # indicators and the battery saver too, or it quietly disagrees with
+        # the keyboard sitting under the screen.
+        self._colors = kbd_backend.preview_frame(look, zones, phase, config)
+        self._on = kbd_backend.preview_lit(look, config, zones)
         self.queue_draw()
 
     def _zone_color(self, zone):

@@ -43,8 +43,8 @@ def _run_flash(args):
     print("reverted")
 
 
-def _run_kbd_daemon(args):
-    from .kbd.service import main
+def _run_kbd_effects(args):
+    from .kbd.effects import main
     main()
 
 
@@ -59,6 +59,12 @@ def _kbd_zone_indices(name):
     return [names[name]]
 
 
+def _kbd_bool(value):
+    """--flag on|off, which reads better than a pair of --x/--no-x flags
+    once there are six of them."""
+    return value == "on"
+
+
 def _run_kbd(args):
     """The laptop's own four-zone keyboard. See hyprutil/kbd/ for the protocol."""
     from . import kbd
@@ -67,21 +73,34 @@ def _run_kbd(args):
         if args.kbd_command == "probe":
             print(json.dumps(kbd.probe(), indent=2))
             return
+        if args.kbd_command == "effects":
+            for effect in kbd.EFFECTS:
+                marks = []
+                if effect in kbd.ANIMATED:
+                    marks.append("animated")
+                if effect in kbd.COLOURLESS_EFFECTS:
+                    marks.append("ignores your colours")
+                suffix = f"  [{', '.join(marks)}]" if marks else ""
+                print(f"{effect:<9} {kbd.EFFECT_DESCRIPTIONS[effect]}{suffix}")
+            return
+        if args.kbd_command == "reload":
+            kbd.reload()
+            print("applied the saved look")
+            return
         if args.kbd_command == "status":
-            reply = kbd.status()
-            keyboard = reply.get("keyboard")
-            print(f"keyboard:   {keyboard['describe'] if keyboard else 'none'}"
-                  + (f" (type {keyboard['type']}, {keyboard['type_name']})" if keyboard else ""))
-            print(f"backlight:  {'on' if reply.get('lit') else 'off'}")
-            look = reply.get("look") or {}
-            print(f"effect:     {look.get('effect')} at speed {look.get('speed')}")
-            print(f"brightness: {look.get('brightness')}")
-            for zone in kbd.DISPLAY_ORDER:
-                colors = look.get("colors") or []
-                if zone < len(colors):
-                    print(f"  {kbd.ZONE_NAMES[zone]:<7} #{colors[zone]}")
-            if reply.get("error"):
-                print(f"error:      {reply['error']}")
+            _print_kbd_status(kbd)
+            return
+        if args.kbd_command == "preset":
+            _run_kbd_preset(kbd, args)
+            return
+        if args.kbd_command == "indicators":
+            _run_kbd_indicators(kbd, args)
+            return
+        if args.kbd_command == "saver":
+            _run_kbd_saver(kbd, args)
+            return
+        if args.kbd_command == "match":
+            _run_kbd_match(kbd, args)
             return
 
         look = dict(kbd.read_current())
@@ -105,15 +124,152 @@ def _run_kbd(args):
                 look["brightness"] = args.brightness
         kbd.apply(look)
         print("applied")
-    except kbd.ServiceUnavailable as e:
-        raise SystemExit(
-            f"{e}\n"
-            "The lighting service is not running. Start it with\n"
-            "    sudo systemctl start hypr-util-kbd.service\n"
-            "or run this command under sudo to drive the keyboard directly."
-        )
-    except kbd.MailboxError as e:
+    except kbd.DeviceError as e:
         raise SystemExit(str(e))
+
+
+def _print_kbd_status(kbd):
+    reply = kbd.status()
+    keyboard = reply.get("keyboard")
+    print(f"keyboard:   {keyboard['describe'] if keyboard else 'none'}"
+          + (f" (type {keyboard['type']}, {keyboard['type_name']})" if keyboard else ""))
+    print(f"backlight:  {'on' if reply.get('lit') else 'off'}")
+    look = reply.get("look") or {}
+    effective = reply.get("effective_look") or look
+    print(f"effect:     {look.get('effect')} at speed {look.get('speed')}")
+    print(f"brightness: {look.get('brightness')}")
+    if reply.get("saving"):
+        # Worth saying out loud: the keyboard is deliberately not showing
+        # what the saved look says, and someone who did not set this up
+        # would otherwise be hunting a bug.
+        print(f"            battery saver is on -- showing "
+              f"{effective.get('effect')} at brightness {effective.get('brightness')}")
+    for zone in kbd.DISPLAY_ORDER:
+        colors = look.get("colors") or []
+        if zone < len(colors):
+            print(f"  {kbd.ZONE_NAMES[zone]:<7} #{colors[zone]}")
+
+    telemetry = reply.get("telemetry") or {}
+    battery = telemetry.get("battery")
+    power = telemetry.get("profile") or "unknown"
+    if battery is not None:
+        charge = " charging" if telemetry.get("charging") else ""
+        power += f", battery {battery}%{charge}"
+    print(f"machine:    {power}")
+
+    shown = reply.get("indicators") or []
+    if shown:
+        print("indicators:")
+        for item in shown:
+            print(f"  {item['zone_name']:<7} #{item['color']}  {item['label']}")
+    else:
+        print("indicators: none showing")
+    if reply.get("error"):
+        print(f"error:      {reply['error']}")
+
+
+def _run_kbd_preset(kbd, args):
+    if args.list or (args.slot is None and not args.save):
+        current = kbd.read_current()
+        for slot, look in kbd.presets.read_all().items():
+            colors = " ".join(look["colors"])
+            marker = "*" if _looks_match(look, current) else " "
+            print(f"{marker}{slot}  {look['name']:<12} {look['effect']:<9} {colors}")
+        return
+    if args.save:
+        saved = kbd.save_preset(args.save, name=args.name)
+        print(f"saved the current look into slot {args.save} as {saved['name']!r}")
+        return
+    applied = kbd.apply_preset(args.slot)
+    name = kbd.presets.read(args.slot)["name"]
+    print(f"applied preset {args.slot} ({name})")
+    return applied
+
+
+def _looks_match(preset, current):
+    """Whether a preset is what the keyboard is currently set to.
+
+    Compared on the look only -- the name is not part of what is showing.
+    """
+    keys = ("effect", "colors", "brightness", "speed")
+    return all(preset.get(k) == current.get(k) for k in keys)
+
+
+def _run_kbd_indicators(kbd, args):
+    patch = {"indicators": {}}
+    section = patch["indicators"]
+    if args.enabled:
+        section["enabled"] = _kbd_bool(args.enabled)
+    if args.when_off:
+        section["when_off"] = _kbd_bool(args.when_off)
+    if args.profile:
+        section.setdefault("profile", {})["enabled"] = _kbd_bool(args.profile)
+    if args.battery:
+        section.setdefault("battery", {})["enabled"] = _kbd_bool(args.battery)
+    if args.profile_zone:
+        section.setdefault("profile", {})["zone"] = _kbd_zone_indices(args.profile_zone)[0]
+    if args.battery_zone:
+        section.setdefault("battery", {})["zone"] = _kbd_zone_indices(args.battery_zone)[0]
+    if args.low is not None:
+        section.setdefault("battery", {})["low"] = args.low
+    if args.critical is not None:
+        section.setdefault("battery", {})["critical"] = args.critical
+
+    if section:
+        kbd.update_settings(patch)
+    config = kbd.read_settings()["indicators"]
+    print(f"indicators:   {'on' if config['enabled'] else 'off'}")
+    print(f"when off:     {'shown' if config['when_off'] else 'hidden'}")
+    print(f"power profile {'on' if config['profile']['enabled'] else 'off':<4}"
+          f" on the {kbd.ZONE_NAMES[config['profile']['zone']]} zone")
+    battery = config["battery"]
+    print(f"battery       {'on' if battery['enabled'] else 'off':<4}"
+          f" on the {kbd.ZONE_NAMES[battery['zone']]} zone,"
+          f" low at {battery['low']}%, critical at {battery['critical']}%")
+    showing = kbd.status().get("indicators") or []
+    print("showing now:  " + (", ".join(i["label"] for i in showing) or "nothing"))
+
+
+def _run_kbd_saver(kbd, args):
+    patch = {}
+    if args.enabled:
+        patch["enabled"] = _kbd_bool(args.enabled)
+    if args.brightness is not None:
+        patch["brightness"] = args.brightness
+    if args.static_only:
+        patch["static_only"] = _kbd_bool(args.static_only)
+    if patch:
+        kbd.update_settings({"battery_saver": patch})
+    config = kbd.read_settings()["battery_saver"]
+    telemetry = kbd.sysinfo.telemetry()
+    where = "battery" if telemetry.get("on_ac") is False else "mains"
+    print(f"battery saver: {'on' if config['enabled'] else 'off'}")
+    print(f"  brightness:  caps at {config['brightness']}")
+    print(f"  animations:  {'stopped' if config['static_only'] else 'kept'} on battery")
+    print(f"  right now:   on {where}"
+          + (" -- saver active" if config["enabled"] and where == "battery" else ""))
+
+
+def _run_kbd_match(kbd, args):
+    patch = {}
+    if args.enabled:
+        patch["enabled"] = _kbd_bool(args.enabled)
+    if args.zone:
+        patch["source_zone"] = _kbd_zone_indices(args.zone)[0]
+    if args.effect:
+        patch["match_effect"] = _kbd_bool(args.effect)
+    if patch:
+        kbd.update_settings({"sync": patch})
+    config = kbd.read_settings()["sync"]
+    print(f"match the Firefly: {'on' if config['enabled'] else 'off'}"
+          f", from the {kbd.ZONE_NAMES[config['source_zone']]} zone"
+          f", effect {'matched' if config['match_effect'] else 'left alone'}")
+    if args.now:
+        sent = kbd.match_firefly()
+        if sent:
+            print(f"  sent: {sent['effect']} #{sent['color']}")
+        else:
+            print("  the Firefly is not connected")
 
 
 def main(argv=None):
@@ -135,23 +291,72 @@ def main(argv=None):
     sub.add_parser("tray", help="Run the tray icon (PyQt6)").set_defaults(func=_run_tray)
     sub.add_parser("daemon", help="Run the automation daemon").set_defaults(func=_run_daemon)
 
+    # Imported here rather than at module scope so `hyprutil --help` does not
+    # pay for it: the effect list has to be the real one, or --effect would
+    # reject the six animations added after this parser was first written.
+    from .kbd.zones import EFFECTS as KBD_EFFECTS
+
     kbd_parser = sub.add_parser("kbd", help="Laptop keyboard lighting (four zones)")
     kbd_sub = kbd_parser.add_subparsers(dest="kbd_command", required=True)
     kbd_sub.add_parser("status", help="What the keyboard is showing")
-    kbd_sub.add_parser("probe", help="Diagnostics: transport, keyboard type, raw values")
+    kbd_sub.add_parser("probe", help="Diagnostics: the driver, keyboard type, raw values")
     kbd_sub.add_parser("on", help="Turn the backlight on")
     kbd_sub.add_parser("off", help="Turn the backlight off")
     kbd_set = kbd_sub.add_parser("set", help="Change colour, effect, speed or brightness")
     kbd_set.add_argument("--color", help="hex colour, e.g. ff0000")
     kbd_set.add_argument("--zone", default="all", help="all, left, middle, right or wasd")
-    kbd_set.add_argument("--effect", choices=["static", "breathe", "cycle", "wave"])
+    kbd_set.add_argument("--effect", choices=KBD_EFFECTS)
     kbd_set.add_argument("--speed", type=int, choices=range(1, 6))
     kbd_set.add_argument("--brightness", type=int, metavar="0-100")
+
+    kbd_sub.add_parser("effects", help="List the effects, with what each one does")
+
+    kbd_preset = kbd_sub.add_parser("preset", help="Apply, save or list the four presets")
+    kbd_preset.add_argument("slot", nargs="?", type=int, choices=[1, 2, 3, 4],
+                            help="the slot to apply; omit to list them")
+    kbd_preset.add_argument("--save", type=int, choices=[1, 2, 3, 4],
+                            metavar="SLOT", help="save the current look into this slot")
+    kbd_preset.add_argument("--name", help="name to save it under")
+    kbd_preset.add_argument("--list", action="store_true", help="list the presets")
+
+    kbd_ind = kbd_sub.add_parser(
+        "indicators",
+        help="Status lights for the power profile and the battery",
+    )
+    kbd_ind.add_argument("--enabled", choices=["on", "off"])
+    kbd_ind.add_argument("--when-off", choices=["on", "off"], dest="when_off",
+                         help="keep showing them with the lighting switched off")
+    kbd_ind.add_argument("--profile", choices=["on", "off"])
+    kbd_ind.add_argument("--profile-zone", help="all, left, middle, right or wasd")
+    kbd_ind.add_argument("--battery", choices=["on", "off"])
+    kbd_ind.add_argument("--battery-zone", help="all, left, middle, right or wasd")
+    kbd_ind.add_argument("--low", type=int, metavar="PCT", help="low battery threshold")
+    kbd_ind.add_argument("--critical", type=int, metavar="PCT")
+
+    kbd_saver = kbd_sub.add_parser("saver", help="Dim the keyboard on battery")
+    kbd_saver.add_argument("--enabled", choices=["on", "off"])
+    kbd_saver.add_argument("--brightness", type=int, metavar="0-100")
+    kbd_saver.add_argument("--static-only", choices=["on", "off"], dest="static_only",
+                           help="stop animations while on battery")
+
+    kbd_match = kbd_sub.add_parser(
+        "match", help="Make the external Firefly follow this keyboard's colour"
+    )
+    kbd_match.add_argument("--enabled", choices=["on", "off"])
+    kbd_match.add_argument("--zone", help="which zone's colour to copy")
+    kbd_match.add_argument("--effect", choices=["on", "off"],
+                           help="also translate the effect, not just the colour")
+    kbd_match.add_argument("--now", action="store_true", help="push a match right now")
+
     kbd_parser.set_defaults(func=_run_kbd)
 
+    kbd_sub.add_parser(
+        "reload", help="Re-apply the saved look (what boot and resume run)"
+    )
+
     sub.add_parser(
-        "kbd-daemon", help="Run the root keyboard lighting service (systemd starts this)"
-    ).set_defaults(func=_run_kbd_daemon)
+        "kbd-effects", help="Run the keyboard effect animation (systemd starts this)"
+    ).set_defaults(func=_run_kbd_effects)
 
     flash_parser = sub.add_parser("flash", help="Manually apply an RGB effect/color, then revert")
     flash_parser.add_argument("effect", nargs="?")

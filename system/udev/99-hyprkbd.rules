@@ -1,0 +1,18 @@
+# Hand the laptop keyboard's lighting to the desktop user.
+#
+# The hyprkbd driver publishes its attributes root-writable, which is the
+# right default for a kernel module but leaves the settings app -- a
+# desktop application -- unable to change a colour. This rule gives them to
+# the user who installed hypr-util; setup.sh substitutes the uid and gid
+# below.
+#
+# The driver creates these files through its driver_data dev_groups, so they
+# exist before this "add" event is sent and the chown cannot race them.
+#
+# Writing to them can set the keyboard's colours and nothing else: the ACPI
+# method behind them is fixed in the module, which is the whole point of
+# having one. The alternative this replaced -- write access to
+# /proc/acpi/call -- would have handed the session every ACPI method on the
+# machine.
+ACTION=="add|change", SUBSYSTEM=="platform", KERNEL=="hyprkbd", \
+  RUN+="/bin/sh -c 'chown @OWNER@ /sys%p/colors /sys%p/zone[0-3] /sys%p/backlight /sys%p/refresh 2>/dev/null; exit 0'"
