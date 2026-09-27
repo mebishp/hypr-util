@@ -21,6 +21,14 @@ DEFAULT_CURVES = {
 CURVE_FILENAMES = {"power-saver": "eco", "balanced": "balanced", "performance": "performance"}
 
 
+# CPU package sensors, best first: k10temp for AMD, zenpower for the
+# out-of-tree Zen module some people run instead, coretemp for Intel (whose
+# temp1 is "Package id 0", as k10temp's is Tctl). Nothing generic goes here --
+# the daemon takes pwm1 out of firmware auto mode, so a sensor like acpitz
+# that can read flat under load would hold the fan down over a hot CPU.
+CPU_HWMON_NAMES = ("k10temp", "zenpower", "coretemp")
+
+
 def find_hwmon_by_name(name):
     for d in Path("/sys/class/hwmon").glob("hwmon*"):
         try:
@@ -31,15 +39,24 @@ def find_hwmon_by_name(name):
     return None
 
 
-HP_HWMON = find_hwmon_by_name("hp")
-CPU_HWMON = find_hwmon_by_name("k10temp")
-
-
 def read_int(path, default=None):
     try:
         return int(path.read_text().strip())
     except (OSError, ValueError):
         return default
+
+
+def find_cpu_hwmon():
+    """The first CPU package sensor that is present and reads a temperature."""
+    for name in CPU_HWMON_NAMES:
+        hwmon = find_hwmon_by_name(name)
+        if hwmon and read_int(hwmon / "temp1_input") is not None:
+            return hwmon
+    return None
+
+
+HP_HWMON = find_hwmon_by_name("hp")
+CPU_HWMON = find_cpu_hwmon()
 
 
 def read_status():

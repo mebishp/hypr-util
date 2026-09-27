@@ -1,5 +1,6 @@
 #!/bin/bash
-# Multi-point fan curve daemon, driven by k10temp, controlling the hp-wmi pwm1 fan.
+# Multi-point fan curve daemon, driven by the CPU package sensor (k10temp on
+# AMD, coretemp on Intel), controlling the hp-wmi pwm1 fan.
 #
 # The active curve follows power-profiles-daemon's current profile (eco/balanced/
 # performance), however it was changed -- by this app's tray, gnome-control-center,
@@ -56,10 +57,27 @@ find_hwmon_by_name() {
 	return 1
 }
 
+# Kept in step with CPU_HWMON_NAMES in hyprutil/fan.py, which explains the
+# order and why no generic thermal zone is on the list.
+CPU_HWMON_NAMES="k10temp zenpower coretemp"
+
+find_cpu_hwmon() {
+	local name d
+	for name in $CPU_HWMON_NAMES; do
+		d=$(find_hwmon_by_name "$name") || continue
+		if [ -n "$(cat "$d/temp1_input" 2>/dev/null)" ]; then
+			echo "$d"
+			return 0
+		fi
+	done
+	return 1
+}
+
 HP_HWMON=$(find_hwmon_by_name hp) || true
-CPU_HWMON=$(find_hwmon_by_name k10temp) || true
+CPU_HWMON=$(find_cpu_hwmon) || true
 if [ -z "$HP_HWMON" ] || [ -z "$CPU_HWMON" ]; then
-	log "could not find hwmon device(s) -- hp=${HP_HWMON:-<missing>} k10temp=${CPU_HWMON:-<missing>}"
+	log "could not find hwmon device(s) -- hp=${HP_HWMON:-<missing>} cpu=${CPU_HWMON:-<missing>}"
+	[ -n "$CPU_HWMON" ] || log "  looked for a CPU sensor named one of: $CPU_HWMON_NAMES"
 	exit 1
 fi
 TEMP_INPUT="$CPU_HWMON/temp1_input"

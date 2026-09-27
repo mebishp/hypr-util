@@ -327,7 +327,8 @@ def main():
         sys.exit(0)
 
     if core.HP_HWMON is None or core.CPU_HWMON is None:
-        print("Could not find hp or k10temp hwmon devices", file=sys.stderr)
+        print("Could not find the hp fan hwmon device, or a CPU sensor named "
+              f"one of: {', '.join(core.CPU_HWMON_NAMES)}", file=sys.stderr)
         sys.exit(1)
     core.ensure_config_defaults()
 

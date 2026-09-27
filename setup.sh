@@ -64,28 +64,67 @@ check_preconditions() {
 	sudo -v || die "this installer needs sudo privileges"
 }
 
+# Prints, one per line, whichever of $2... isn't installed according to $1
+# (a package manager's "is this installed" query, e.g. "pacman -Qi" or
+# "dpkg -s" -- unquoted on purpose, so a two-word query splits back into a
+# command and its flag).
+missing_packages() {
+	local query=$1; shift
+	local pkg
+	for pkg in "$@"; do
+		$query "$pkg" >/dev/null 2>&1 || printf '%s\n' "$pkg"
+	done
+}
+
+# dkms builds the laptop keyboard lighting driver (kernel/hyprkbd), which is
+# what carries the colours: the kernel's own hp-wmi driver speaks the same
+# BIOS mailbox but has no lighting code, and nothing else reaches it.
+# Everything else here still works without it; only the Laptop page goes
+# dark.
+#
+# Package names for the same six dependencies, one set per manager -- distro
+# package sets for GTK4/libadwaita's introspection data in particular are not
+# uniform, so these are a best effort. Add another branch the same shape to
+# support one not listed here.
 install_packages() {
-	if ! command -v pacman >/dev/null; then
-		log "pacman not found; install these manually if missing: python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon dkms, and your kernel's headers"
+	local mgr pkgs query installer
+
+	if command -v pacman >/dev/null; then
+		mgr=pacman
+		pkgs=(python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon dkms)
+		query="pacman -Qi"
+		installer="sudo pacman -S --needed"
+	elif command -v apt-get >/dev/null; then
+		mgr=apt
+		pkgs=(python3-pyqt6 python3-gi python3-pyudev gir1.2-adw-1 gir1.2-gtk-4.0 power-profiles-daemon dkms)
+		query="dpkg -s"
+		installer="sudo apt-get install -y"
+	elif command -v dnf >/dev/null; then
+		mgr=dnf
+		pkgs=(python3-pyqt6 python3-gobject python3-pyudev libadwaita gtk4 power-profiles-daemon dkms)
+		query="rpm -q"
+		installer="sudo dnf install -y"
+	elif command -v zypper >/dev/null; then
+		mgr=zypper
+		pkgs=(python3-PyQt6 python3-gobject python3-pyudev libadwaita-1-0 typelib-1_0-Adw-1 gtk4 typelib-1_0-Gtk-4_0 power-profiles-daemon dkms)
+		query="rpm -q"
+		installer="sudo zypper install -y"
+	else
+		log "no supported package manager found (pacman/apt/dnf/zypper); install these manually if missing: PyQt6 bindings, PyGObject, pyudev, libadwaita, GTK4, power-profiles-daemon, dkms, and your kernel's headers"
 		return
 	fi
-	# dkms builds the laptop keyboard lighting driver (kernel/hyprkbd), which
-	# is what carries the colours: the kernel's own hp-wmi driver speaks the
-	# same BIOS mailbox but has no lighting code, and nothing else reaches
-	# it. Everything else here still works without it; only the Laptop page
-	# goes dark.
-	local pkgs=(python-pyqt6 python-gobject python-pyudev libadwaita gtk4 power-profiles-daemon dkms)
+
 	local missing=()
-	local pkg
-	for pkg in "${pkgs[@]}"; do
-		pacman -Qi "$pkg" >/dev/null 2>&1 || missing+=("$pkg")
-	done
+	mapfile -t missing < <(missing_packages "$query" "${pkgs[@]}")
+
 	if [ "${#missing[@]}" -eq 0 ]; then
 		log "all required packages present"
-	else
-		log "installing: ${missing[*]}"
-		sudo pacman -S --needed "${missing[@]}"
+		return
 	fi
+
+	log "installing: ${missing[*]}"
+	[ "$mgr" = apt ] && sudo apt-get update
+	$installer "${missing[@]}"
 }
 
 # Stop everything before replacing files on disk.
