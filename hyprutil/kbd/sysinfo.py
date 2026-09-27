@@ -16,7 +16,6 @@ ppd names are used here and the sysfs one is translated on the way in,
 because those are the names the rest of the project already speaks.
 """
 import logging
-import os
 import time
 from pathlib import Path
 
@@ -55,36 +54,33 @@ def power_profile():
     return PROFILE_ALIASES.get(raw, raw)
 
 
-def _battery_dir():
-    """The first real battery. Laptops have one; the USB-C power supplies
-    that also appear here are not batteries and must not be mistaken for a
-    flat one."""
-    try:
-        entries = sorted(POWER_SUPPLY.iterdir())
-    except OSError:
-        return None
-    for entry in entries:
-        if _read(entry / "type") == "Battery" and (entry / "capacity").exists():
-            return entry
-    return None
+def _find_supply(kind, needs=None):
+    """The first power supply of a kind, or None.
 
-
-def _on_ac():
-    """True when a mains adapter is plugged in.
-
-    Read from the adapter rather than inferred from the battery's status,
-    because "Full" and "Not charging" both happen on AC and neither says so.
+    Laptops have one battery; the USB-C power supplies that also appear here
+    are not batteries and must not be mistaken for a flat one, which is what
+    the `needs` check is for.
     """
     try:
         entries = sorted(POWER_SUPPLY.iterdir())
     except OSError:
         return None
     for entry in entries:
-        if _read(entry / "type") == "Mains":
-            online = _read(entry / "online")
-            if online is not None:
-                return online == "1"
+        if _read(entry / "type") != kind:
+            continue
+        if needs is None or (entry / needs).exists():
+            return entry
     return None
+
+
+def battery_dir():
+    return _find_supply("Battery", needs="capacity")
+
+
+def mains_dir():
+    # `online` is the only thing we ask an adapter, so an adapter that does
+    # not publish it is not the one we are looking for -- keep walking.
+    return _find_supply("Mains", needs="online")
 
 
 class Telemetry:
@@ -103,6 +99,24 @@ class Telemetry:
             "on_ac": None, "load": 0.0,
         }
         self._cpu_prev = None
+        # Which directory under /sys/class/power_supply is the battery and
+        # which is the adapter, remembered once. Finding them means listing
+        # the directory and reading a `type` file per entry, and neither
+        # answer changes while the machine is running -- doing that twice a
+        # second for a number that moves by 1% an hour was most of what this
+        # class spent its time on. Re-resolved if the directory goes away,
+        # which is the one case where it can change (a hot-plugged supply,
+        # or a suspend that renumbers them).
+        self._battery = None
+        self._mains = None
+
+    def _supply(self, attr, finder):
+        cached = getattr(self, attr)
+        if cached is not None and cached.exists():
+            return cached
+        found = finder()
+        setattr(self, attr, found)
+        return found
 
     def _cpu_load(self):
         """Busy fraction since the previous call, from /proc/stat.
@@ -111,11 +125,19 @@ class Telemetry:
         than the since-boot average, which would be a meaningless number to
         light a keyboard with.
         """
-        line = _read(PROC_STAT, "")
+        # Only the first line is wanted, and /proc/stat is a long file on a
+        # machine with many cores -- one line per CPU plus the interrupt
+        # table. Reading the whole thing to parse its first 60 bytes is the
+        # kind of waste that happens every half second under the CPU meter.
+        try:
+            with open(PROC_STAT, "rb") as f:
+                line = f.readline().decode()
+        except OSError:
+            return 0.0
         if not line.startswith("cpu "):
             return 0.0
         try:
-            fields = [int(v) for v in line.split("\n", 1)[0].split()[1:]]
+            fields = [int(v) for v in line.split()[1:]]
         except ValueError:
             return 0.0
         if len(fields) < 4:
@@ -138,7 +160,7 @@ class Telemetry:
         self._taken = now
 
         battery = charging = None
-        entry = _battery_dir()
+        entry = self._supply("_battery", battery_dir)
         if entry is not None:
             raw = _read(entry / "capacity")
             if raw is not None:
@@ -152,10 +174,23 @@ class Telemetry:
             "profile": power_profile(),
             "battery": battery,
             "charging": charging,
-            "on_ac": _on_ac(),
+            "on_ac": self._on_ac(),
             "load": self._cpu_load(),
         }
         return self._sample
+
+    def _on_ac(self):
+        """True when a mains adapter is plugged in.
+
+        Read from the adapter rather than inferred from the battery's status,
+        because "Full" and "Not charging" both happen on AC and neither says
+        so.
+        """
+        entry = self._supply("_mains", mains_dir)
+        if entry is None:
+            return None
+        online = _read(entry / "online")
+        return None if online is None else online == "1"
 
 
 # A process-wide default, so the CLI and the service share one /proc/stat
