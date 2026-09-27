@@ -12,27 +12,31 @@ import json
 import os
 from pathlib import Path
 
-from . import zones
+from . import indicators, zones
 from ..util import CONFIG_DIR, atomic_write_text
 
-# Zone defaults chosen so the two indicators do not land on top of each
-# other, and so neither takes the middle of the board -- that is the part
-# a person actually looks at while typing.
+# Indicators have no zone any more: an alert is the whole keyboard for a
+# couple of seconds and then the look comes back. See kbd/indicators.py for
+# why that replaced a permanently reserved zone. A `zone` left in an old
+# settings file is simply not read -- _merge only ever takes the keys the
+# defaults below name.
 DEFAULTS = {
     "indicators": {
         "enabled": True,
-        # Keep showing status on a keyboard whose lighting is switched off.
-        # The backlight goes on with every other zone written black, which
-        # reads as a dark keyboard with one status light -- measured on this
-        # board: a zone set to 000000 is genuinely dark, not dimly lit.
+        # Keep showing status on a keyboard whose lighting is switched off:
+        # the backlight comes on for the alert and goes back off after it.
         "when_off": True,
-        "profile": {"enabled": True, "zone": zones.ZONE_RIGHT},
+        # How long the board is held. Long enough to catch out of the corner
+        # of your eye, short enough not to feel like the app has hung.
+        "duration": indicators.DEFAULT_DURATION,
+        "profile": {"enabled": True},
         "battery": {
             "enabled": True,
-            "zone": zones.ZONE_LEFT,
             "low": 25,
             "critical": 10,
             "show_charging": True,
+            # A critical battery is the one thing worth saying twice.
+            "repeat_critical": indicators.DEFAULT_CRITICAL_REPEAT,
         },
     },
     "battery_saver": {
@@ -80,20 +84,30 @@ def _merge(defaults, data):
     return out
 
 
+def _number(value, fallback, low, high):
+    try:
+        return max(low, min(high, float(value)))
+    except (TypeError, ValueError):
+        return fallback
+
+
 def normalize(data):
     out = _merge(DEFAULTS, data)
-    battery = out["indicators"]["battery"]
+    ind = out["indicators"]
+    ind["duration"] = _number(
+        ind["duration"], indicators.DEFAULT_DURATION,
+        indicators.MIN_DURATION, indicators.MAX_DURATION,
+    )
+    battery = ind["battery"]
     battery["low"] = max(1, min(100, battery["low"]))
     # A critical threshold at or above the low one would mean the low state
     # could never be reached; clamp rather than refuse, since this comes
     # from a file a person may have edited.
     battery["critical"] = max(1, min(battery["low"] - 1, battery["critical"])) \
         if battery["low"] > 1 else 1
-    for section, key in (("indicators", "profile"), ("indicators", "battery")):
-        zone = out[section][key]["zone"]
-        if zone not in zones.ZONE_NAMES:
-            zone = DEFAULTS[section][key]["zone"]
-        out[section][key]["zone"] = zone
+    battery["repeat_critical"] = _number(
+        battery["repeat_critical"], indicators.DEFAULT_CRITICAL_REPEAT, 30.0, 3600.0,
+    )
     saver = out["battery_saver"]
     saver["brightness"] = max(0, min(zones.BRIGHTNESS_MAX, saver["brightness"]))
     return out

@@ -71,6 +71,14 @@ ANIMATED = {"breathe", "pulse", "cycle", "wave", "sweep", "aurora", "fire", "met
 # knowing so the UI can grey the pickers out rather than letting someone
 # choose a colour that will not be used.
 COLOURLESS_EFFECTS = {"cycle", "wave", "aurora", "fire", "meter"}
+# Effects that read as one picture running across the board rather than as
+# four independent zones. For those, WASD takes the left zone's colour and
+# the keyboard behaves as three bands -- which is what it looks like, since
+# the WASD keys sit inside the left third rather than beside it. Left as its
+# own zone for the effects where a separately lit cluster is the point
+# (static, breathe, pulse, fire) or where every zone is the same colour
+# anyway (cycle).
+MERGE_WASD = {"gradient", "wave", "sweep", "aurora", "meter"}
 
 # Where each zone physically sits across the keyboard, left 0.0 to right 1.0.
 # The firmware's zone numbering is not spatial, and the travelling effects
@@ -109,6 +117,13 @@ DEFAULT_LOOK = {
 # -- colour helpers --
 
 def to_rgb(color):
+    # A plain 3-tuple is taken as already clamped. Everything in this module
+    # that produces one has clamped it, and the animation path hands those
+    # tuples straight back here -- four zones, eight times a second, plus
+    # once more per alert frame. Re-validating colours we just computed is
+    # the kind of cost that only shows up as a warm laptop.
+    if type(color) is tuple and len(color) == 3:
+        return color
     if isinstance(color, (tuple, list)):
         return tuple(max(0, min(255, int(c))) for c in color[:3])
     text = str(color).lstrip("#")
@@ -137,6 +152,15 @@ def blend(first, second, amount):
     amount = max(0.0, min(1.0, amount))
     a, b = to_rgb(first), to_rgb(second)
     return tuple(round(a[i] + (b[i] - a[i]) * amount) for i in range(3))
+
+
+def merges_wasd(effect):
+    """Whether this effect wants WASD folded into the left zone.
+
+    Asked by the preview as well as by the frame builder, so the drawing on
+    screen loses the WASD cluster at exactly the moment the keyboard does.
+    """
+    return effect in MERGE_WASD
 
 
 def _position(index, count):
@@ -257,13 +281,35 @@ def effect_frame(effect, phase, colors, index, telemetry=None):
 
 
 def frame_colors(look, zones, phase=0.0, telemetry=None):
-    """Every zone's colour for this look at this phase, brightness applied."""
+    """Every zone's colour for this look at this phase, brightness applied.
+
+    `look` must already be normalized -- this is the inner loop of the
+    animation, run four times a frame at eight frames a second in two
+    processes, and re-validating a dict that the caller has already
+    validated is the whole of what it used to spend its time on.
+    """
+    effect = look["effect"]
     base = zone_colors(look, zones)
+    if effect not in COLOURLESS_EFFECTS:
+        # Parsed once here rather than once per zone inside effect_frame:
+        # the colours are hex on disk and tuples everywhere else, and this
+        # is the single place the conversion has to happen. Skipped whole
+        # for the effects that paint their own hues -- parsing four colours
+        # that nothing is going to read is pure loss at eight frames a
+        # second.
+        base = [to_rgb(c) for c in base]
     factor = max(MIN_SCALE, look["brightness"] / 100.0)
-    return [
-        scale(effect_frame(look["effect"], phase, base, i, telemetry), factor)
-        for i in range(len(base))
+    count = len(base)
+    frame = [
+        scale(effect_frame(effect, phase, base, i, telemetry), factor)
+        for i in range(count)
     ]
+    if count == 4 and merges_wasd(effect):
+        # One picture across the board rather than four zones: WASD is
+        # inside the left third, so it takes the left zone's colour and the
+        # keyboard reads as three bands.
+        frame[ZONE_WASD] = frame[ZONE_LEFT]
+    return frame
 
 
 # -- battery saver --
@@ -294,34 +340,46 @@ def apply_battery_saver(look, saver, telemetry):
 
 # -- composition --
 
-def compose(look, zone_count=4, phase=0.0, overlays=(), telemetry=None):
-    """The frame to write: the look, with indicators held over it.
+def compose(look, zone_count=4, phase=0.0, alert=None, telemetry=None, now=None):
+    """The frame to write: the look, or the alert that has taken it over.
 
-    A look that is switched off contributes a black board rather than
-    nothing at all, which is what lets an indicator show on a keyboard whose
-    lighting the user has turned off -- the backlight goes on, every other
-    zone is black, and the result reads as dark with one status light.
+    An alert owns the whole keyboard for its couple of seconds -- that is
+    the point of it -- and only its two fading edges need the look
+    underneath, to cross into and back out of. The look's phase is not
+    advanced during an alert (see effects.Animator.tick), so what comes back
+    afterwards is the frame the effect was on rather than the one it would
+    have reached.
+
+    `look` must already be normalized; the callers that take one off disk or
+    out of a UI do that once, at the edge.
     """
-    look = normalize_look(look)
-    if look["on"]:
-        frame = frame_colors(look, zone_count, phase, telemetry)
-    else:
-        frame = [(0, 0, 0)] * zone_count
-    for overlay in overlays:
-        if 0 <= overlay.zone < len(frame):
-            frame[overlay.zone] = overlay.render(phase)
-    return frame
+    lit = look["on"]
+    if alert is not None:
+        color, mix = alert.frame(now)
+        if mix >= 1.0:
+            return [color] * zone_count
+        under = (frame_colors(look, zone_count, phase, telemetry) if lit
+                 else [(0, 0, 0)] * zone_count)
+        return [blend(c, color, mix) for c in under]
+    if lit:
+        return frame_colors(look, zone_count, phase, telemetry)
+    return [(0, 0, 0)] * zone_count
 
 
-def backlight_wanted(look, overlays=()):
-    """Whether the backlight should be lit at all."""
-    return bool(normalize_look(look)["on"] or overlays)
+def backlight_wanted(look, alert=None):
+    """Whether the backlight should be lit at all.
+
+    An alert lights a keyboard whose lighting is switched off, which is what
+    lets the machine say something on a board someone has deliberately left
+    dark -- and then put it back the way it was.
+    """
+    return bool(look["on"] or alert is not None)
 
 
 # -- the hardware --
 
-def apply_look(look, zones=4, phase=0.0, frame_only=False, overlays=(),
-               telemetry=None):
+def apply_look(look, zones=4, phase=0.0, frame_only=False, alert=None,
+               telemetry=None, now=None):
     """Put a look on the keyboard: colours first, then the backlight.
 
     Order matters when turning it on -- writing the colours while the board
@@ -333,10 +391,10 @@ def apply_look(look, zones=4, phase=0.0, frame_only=False, overlays=(),
     way; the driver holds the firmware's table.
     """
     look = normalize_look(look)
-    lit = backlight_wanted(look, overlays)
+    lit = backlight_wanted(look, alert)
     if lit:
         device.write_colors([
-            to_hex(c) for c in compose(look, zones, phase, overlays, telemetry)
+            to_hex(c) for c in compose(look, zones, phase, alert, telemetry, now)
         ])
     if not frame_only:
         device.write_backlight(lit)

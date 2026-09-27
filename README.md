@@ -10,7 +10,7 @@ mailbox, and a multi-point fan curve that follows the power profile.
 ## Parts
 
 - `hyprutil/`: the Python package -- fan curve, display refresh rate, the GTK4/Adwaita settings window and PyQt6 tray under `hyprutil/ui/`, and the automation daemon
-- `hyprutil/kbd/`: the laptop's four-zone keyboard -- the driver's sysfs files (`device.py`), the lighting model and ten effects (`zones.py`), the animation service (`effects.py`), status lights (`indicators.py` over `sysinfo.py`), and saved looks (`presets.py`)
+- `hyprutil/kbd/`: the laptop's four-zone keyboard -- the driver's sysfs files (`device.py`), the lighting model and ten effects (`zones.py`), the animation service (`effects.py`), whole-board status flashes (`indicators.py` over `sysinfo.py`), and saved looks (`presets.py`)
 - `kernel/hyprkbd/`: the DKMS kernel module that carries the laptop keyboard's colours, so nothing above it needs root
 - `bin/hyprutil`: run-from-checkout launcher, for working on the code without installing
 - `system/`: everything installed outside the repo, in subdirectories named for where it goes (`bin/`, `dbus/`, `desktop/`, `icons/`, `modules-load/`, `sleep/`, `systemd/`, `udev/`)
@@ -43,7 +43,7 @@ hyprutil app       # settings window
 hyprutil tray      # tray icon
 hyprutil daemon    # automation daemon
 
-hyprutil kbd status                          # the keyboard's four zones
+hyprutil kbd status                          # the laptop keyboard's four zones
 hyprutil kbd probe                           # why it is not working
 hyprutil kbd set --color ff0000 --zone wasd
 hyprutil kbd set --effect wave --speed 4
@@ -54,7 +54,7 @@ hyprutil kbd effects                         # the ten effects, and what each do
 hyprutil kbd preset                          # list the four slots
 hyprutil kbd preset 3                        # apply one
 hyprutil kbd preset --save 3 --name Ember    # save the current look into one
-hyprutil kbd indicators --battery on --low 20
+hyprutil kbd indicators --battery on --low 20 --duration 3
 hyprutil kbd saver --enabled on --brightness 30
 ```
 
@@ -190,27 +190,48 @@ named for rather than filling a band.
 `gradient` and `static` are a single write and then nothing, so the effects
 service idles through them rather than waking eight times a second.
 
-### Indicators
+### Status flashes
 
-A zone can be held aside to show what the machine is doing.
+When the machine changes, the **whole keyboard** takes a colour for a couple
+of seconds and then the effect you were running comes back exactly where it
+left off.
 
 | | |
 |---|---|
-| Power profile | green saver, yellow balanced, red performance |
-| Battery low | amber, solid |
-| Battery critical | red, blinking |
-| Charging | green, pulsing |
+| Power profile changed | green saver, yellow balanced, red performance; pulsing |
+| Battery fell below low | amber, solid |
+| Battery fell below critical | red, blinking, repeating every five minutes |
+| Charger in | green, pulsing |
+| Charger out | amber, pulsing |
 
-They are composited over the look rather than replacing it, and the higher
-priority wins a contested zone outright -- a blend of "battery critical" and
-"performance mode" is a colour that means neither.
+This replaced an earlier design that held one zone aside for the whole
+session. A permanently coloured corner is a poor status light: nothing about
+it moves when the status does, so you stop seeing it; it costs a quarter of
+the board all the time; and it argues with whatever effect is running over
+the other three zones. A flash is the opposite of all three.
 
-**They keep working with the lighting switched off.** That is the point of
-the design: the backlight goes on, every other zone is written `000000`, and
-the board reads as dark with one status light. Measured on this hardware, a
-zone set to black is genuinely dark rather than dimly lit, which is what
-makes that honest. With indicators off and the look off, the backlight byte
-goes to 0 and the keyboard is properly dark.
+They fire on **changes, not states**. "The battery is at 9%" is not news
+eight times a second; "the battery has just fallen below 10%" is. A critical
+battery is the one exception and repeats on a timer.
+
+The look is not disturbed. Its phase is held while the flash is up, so a
+sweep resumes mid-travel rather than restarting, and the two fading edges of
+the flash crossfade against the look rather than dipping through black.
+
+**They work with the lighting switched off.** The backlight comes on for the
+flash and goes back off after it, so a keyboard someone has deliberately left
+dark can still say something and then be dark again. With flashes off and the
+look off, the backlight byte goes to 0 and the keyboard is properly dark.
+
+### Three zones or four
+
+The keyboard has four zones, but the WASD cluster sits *inside* the left
+third rather than beside it. For the effects that run as one picture across
+the board -- gradient, wave, sweep, aurora, the CPU meter -- WASD takes the
+left zone's colour and the keyboard reads as three clean bands. For the rest
+-- static, breathe, pulse, fire -- a separately lit cluster is the point, so
+it keeps its own colour. The settings app greys out the WASD picker and says
+why when the current effect folds it in.
 
 ### Battery saver
 
@@ -243,4 +264,3 @@ cd kernel/hyprkbd && make && sudo insmod hyprkbd.ko
 It needs your kernel's headers, and it follows whatever compiler built the
 running kernel -- a Clang-built kernel (CachyOS ships one) rejects a
 GCC-built module.
-

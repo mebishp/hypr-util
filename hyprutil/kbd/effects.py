@@ -16,11 +16,11 @@ Coordination is the two config files and nothing more. Whoever changes the
 lighting -- the settings app, the tray, `hyprutil kbd set` -- writes the file
 and then writes the hardware itself, so the change is immediate. This loop
 watches both files' mtimes and picks a change up on its next frame. A static
-look with no animated indicator needs no frames at all, so the loop idles at
-a slower poll until something changes.
+look with no alert showing needs no frames at all, so the loop idles at a
+slower poll until something changes.
 
 The service keeps running even with the lighting switched off, because an
-indicator on a dark keyboard is still something to draw.
+alert lights a dark keyboard for its couple of seconds and then puts it back.
 """
 import logging
 import time
@@ -33,11 +33,18 @@ logger = logging.getLogger(__name__)
 # has already put its change on the keyboard by then; this is only about
 # taking over the animation, so it can afford to be lazy.
 IDLE_SECONDS = 1.0
-# How often to re-read the power profile and battery. Faster than that buys
-# nothing a person can see.
-STATUS_SECONDS = 2.0
+# How often to re-read the power profile and battery. This is also how late
+# an alert can be: a profile change has to be noticed before it can flash,
+# so it is the sample rate rather than the frame rate that decides whether
+# the keyboard feels like it is answering the keypress.
+STATUS_SECONDS = 1.0
 # Except for the CPU meter, whose whole job is to follow a number that moves.
 METER_STATUS_SECONDS = 0.5
+# How often to stat the two config files. Every frame is seventeen stat()
+# calls a second to learn something that changes when a person moves a
+# slider; four is plenty, and the writer has already put its own change on
+# the keyboard by the time we notice.
+STAT_SECONDS = 0.25
 # Give up on an effect after this many consecutive write failures, rather
 # than hammering a keyboard that has stopped answering.
 MAX_FAILURES = 5
@@ -51,10 +58,13 @@ class Animator:
         self.settings = settings.normalize({})
         self.zones = 4
         self.phase = 0.0
-        self.overlays = []
+        self.alert = None
         self._stamps = (None, None)
+        self._statted = 0.0
         self._telemetry = sysinfo.Telemetry(refresh=STATUS_SECONDS)
+        self._monitor = indicators.Monitor()
         self._status = {}
+        self._effective = None
         self._last_frame = None
         self._failures = 0
 
@@ -73,6 +83,7 @@ class Animator:
     def load(self):
         """Take the saved look and settings, and put them on the keyboard."""
         self._stamps = self._stat()
+        self._statted = time.monotonic()
         self.look = state.read_current()
         self.settings = settings.read()
         self.phase = 0.0
@@ -85,26 +96,35 @@ class Animator:
         self._draw(frame_only=False)
 
     def _refresh_status(self, force=False):
-        """Re-read the machine, and rebuild the indicators from it."""
+        """Re-read the machine, and let the monitor judge what changed."""
         self._status = self._telemetry.sample(force=force)
-        self.overlays = indicators.build(
-            self.settings["indicators"], self._status, self.zones, self.look["on"],
+        self._effective = zones.apply_battery_saver(
+            self.look, self.settings["battery_saver"], self._status
+        )
+        self.alert = self._monitor.update(
+            self.settings["indicators"], self._status, self.look["on"],
         )
 
     @property
     def effective_look(self):
-        """The look as it should actually be shown, battery saver included."""
-        return zones.apply_battery_saver(
-            self.look, self.settings["battery_saver"], self._status
-        )
+        """The look as it should actually be shown, battery saver included.
+
+        Recomputed when the status is, not on every read: this used to be a
+        property that rebuilt the dict each time, and one tick asks for it
+        three times.
+        """
+        if self._effective is None:
+            self._effective = zones.apply_battery_saver(
+                self.look, self.settings["battery_saver"], self._status
+            )
+        return self._effective
 
     @property
     def animating(self):
+        if self.alert is not None:
+            return True
         look = self.effective_look
-        return (
-            (look["on"] and look["effect"] in zones.ANIMATED)
-            or indicators.wants_animation(self.overlays)
-        )
+        return look["on"] and look["effect"] in zones.ANIMATED
 
     # -- drawing --
 
@@ -113,15 +133,15 @@ class Animator:
 
         Skipping an identical frame is worth the comparison: the CPU meter
         redraws at the frame rate but only changes when the load sample does,
-        and a breathing indicator over a static look holds still for most of
-        its cycle. Each skipped frame is one WMI call the firmware does not
-        have to service.
+        and a slow effect at low brightness can round to the same bytes for
+        several frames running. Each skipped frame is one WMI call the
+        firmware does not have to service.
         """
         look = self.effective_look
-        lit = zones.backlight_wanted(look, self.overlays)
+        lit = zones.backlight_wanted(look, self.alert)
         if lit:
             frame = zones.compose(
-                look, self.zones, self.phase, self.overlays, self._status
+                look, self.zones, self.phase, self.alert, self._status
             )
             if frame != self._last_frame:
                 device.write_colors([zones.to_hex(c) for c in frame])
@@ -136,26 +156,35 @@ class Animator:
 
     def tick(self):
         """One pass: adopt any change, refresh status, then draw a frame."""
-        if self._stat() != self._stamps:
-            # Debug, not info: dragging a colour in the settings app rewrites
-            # this file every couple of hundred milliseconds, and a line per
-            # write would bury everything else in the journal.
-            logger.debug("the saved look or settings changed; picking it up")
-            self.load()
-            self._failures = 0
+        now = time.monotonic()
+        if now - self._statted >= STAT_SECONDS:
+            self._statted = now
+            if self._stat() != self._stamps:
+                # Debug, not info: dragging a colour in the settings app
+                # rewrites this file every couple of hundred milliseconds, and
+                # a line per write would bury everything else in the journal.
+                logger.debug("the saved look or settings changed; picking it up")
+                self.load()
+                self._failures = 0
+                return
+
+        previous = self.alert
+        self._refresh_status()
+
+        if (self.alert is None) != (previous is None):
+            # Arriving at or leaving an alert is the one transition that can
+            # turn the backlight on or off -- an alert shows on a keyboard
+            # whose lighting is switched off -- so it writes more than colours.
+            if self.alert is not None:
+                logger.info("alert: %s", self.alert.label)
+            self._draw(frame_only=False)
             return
 
-        previous = self.overlays
-        self._refresh_status()
-        # A change in what the indicators say has to be drawn even when
-        # nothing is animating -- that is the whole job of a status light.
-        changed = [o.as_dict() for o in previous] != [o.as_dict() for o in self.overlays]
-        if changed:
-            logger.info(
-                "indicators: %s",
-                ", ".join(o.label for o in self.overlays) or "none",
-            )
-            self._draw(frame_only=False)
+        if self.alert is not None:
+            # The look's phase deliberately does not advance while an alert
+            # holds the board: what comes back afterwards is the frame the
+            # effect was on, not the one it would have reached.
+            self._draw(frame_only=True)
             return
 
         if not self.animating:
@@ -190,9 +219,9 @@ def main():
     try:
         animator.load()
         logger.info(
-            "applied the saved look (%s), indicators: %s",
+            "applied the saved look (%s), indicators %s",
             animator.look["effect"],
-            ", ".join(o.label for o in animator.overlays) or "none",
+            "on" if animator.settings["indicators"]["enabled"] else "off",
         )
     except device.DeviceError as e:
         logger.warning("could not apply the saved look: %s", e)

@@ -9,7 +9,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk
+from gi.repository import Adw, Gio, GLib, GObject, Gtk
 
 from .. import fan as backend
 from .. import kbd as kbd_backend
@@ -338,7 +338,11 @@ class LaptopKbdPage(Gtk.Box):
     """
 
     APPLY_DEBOUNCE_MS = 200
+    # The keyboard's own frame rate while something is moving. When nothing
+    # is, the preview only has to be quick enough to notice a status flash
+    # starting, and a quarter of the work is a quarter of the work.
     PREVIEW_INTERVAL_MS = 120
+    PREVIEW_IDLE_MS = 500
 
     def __init__(self):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
@@ -357,7 +361,8 @@ class LaptopKbdPage(Gtk.Box):
 
         self._look = kbd_backend.read_current()
         self._settings = kbd_backend.read_settings()
-        self._indicators_animated = False
+        self._alert = None
+        self._preview_interval = self.PREVIEW_INTERVAL_MS
         self._loading_settings = False
         self._zones = 4
         self._loading = False
@@ -366,9 +371,12 @@ class LaptopKbdPage(Gtk.Box):
         self._phase = 0.0
         self._busy = False
 
-        preview_group = Adw.PreferencesGroup()
+        preview_group = Adw.PreferencesGroup(
+            description="Click a section to change its colour"
+        )
         page.add(preview_group)
         self.preview = _ZonePreview()
+        self.preview.connect("zone-activated", self._on_preview_zone)
         preview_row = Adw.ActionRow()
         preview_row.set_child(self.preview)
         preview_group.add(preview_row)
@@ -400,7 +408,10 @@ class LaptopKbdPage(Gtk.Box):
         )
         lighting.add(self.speed_row)
 
-        self.zones_group = Adw.PreferencesGroup(title="Zones")
+        self.zones_group = Adw.PreferencesGroup(
+            title="Zones",
+            description="Or pick one here -- the same four colours either way",
+        )
         page.add(self.zones_group)
         self._zone_rows = {}
         for zone in kbd_backend.DISPLAY_ORDER:
@@ -502,7 +513,9 @@ class LaptopKbdPage(Gtk.Box):
         self._look = kbd_backend.read_current()
         self._phase = 0.0
         self._load_look_into_controls()
-        self.preview.set_look(self._look, self._zones, self._phase, self._settings)
+        self._alert = self.preview.set_look(
+            self._look, self._zones, self._phase, self._settings
+        )
         self._show_toast(f"Applied {kbd_backend.presets.read(slot)['name']}")
         return False
 
@@ -523,7 +536,7 @@ class LaptopKbdPage(Gtk.Box):
             return
         kbd_backend.presets.rename(slot, name)
 
-    # -- indicators --
+    # -- status flashes --
 
     def _make_zone_combo(self, title, subtitle, handler):
         row = Adw.ComboRow(title=title, subtitle=subtitle)
@@ -544,25 +557,35 @@ class LaptopKbdPage(Gtk.Box):
 
     def _build_indicators(self, page):
         group = Adw.PreferencesGroup(
-            title="Indicators",
+            title="Status flashes",
             description=(
-                "One zone held aside to show the machine's state. These keep "
-                "working with the lighting switched off -- the rest of the "
-                "board goes dark and the indicator stays lit."
+                "The whole keyboard takes a colour for a moment when the "
+                "machine changes, and then the effect you were running comes "
+                "back exactly where it left off."
             ),
         )
         page.add(group)
 
-        self.ind_enabled_row = Adw.SwitchRow(title="Show indicators")
+        self.ind_enabled_row = Adw.SwitchRow(title="Flash on changes")
         self.ind_enabled_row.connect("notify::active", self._on_indicator_toggle)
         group.add(self.ind_enabled_row)
 
         self.ind_when_off_row = Adw.SwitchRow(
-            title="Keep showing when the lighting is off",
-            subtitle="The backlight stays on for the indicator alone",
+            title="Flash with the lighting off",
+            subtitle="The backlight comes on for the flash and goes back off after it",
         )
         self.ind_when_off_row.connect("notify::active", self._on_indicator_toggle)
         group.add(self.ind_when_off_row)
+
+        self.ind_duration_row = Adw.SpinRow.new_with_range(
+            kbd_backend.indicators.MIN_DURATION,
+            kbd_backend.indicators.MAX_DURATION, 0.5,
+        )
+        self.ind_duration_row.set_title("Hold for")
+        self.ind_duration_row.set_subtitle("seconds")
+        self.ind_duration_row.set_digits(1)
+        self.ind_duration_row.connect("notify::value", self._on_indicator_toggle)
+        group.add(self.ind_duration_row)
 
         self.ind_profile_row = Adw.SwitchRow(
             title="Power profile",
@@ -571,22 +594,12 @@ class LaptopKbdPage(Gtk.Box):
         self.ind_profile_row.connect("notify::active", self._on_indicator_toggle)
         group.add(self.ind_profile_row)
 
-        self.ind_profile_zone = self._make_zone_combo(
-            "Profile zone", "Where to show it", self._on_indicator_toggle
-        )
-        group.add(self.ind_profile_zone)
-
         self.ind_battery_row = Adw.SwitchRow(
             title="Battery",
-            subtitle="Amber when low, blinking red when critical, pulsing green while charging",
+            subtitle="Amber on falling below low, blinking red below critical",
         )
         self.ind_battery_row.connect("notify::active", self._on_indicator_toggle)
         group.add(self.ind_battery_row)
-
-        self.ind_battery_zone = self._make_zone_combo(
-            "Battery zone", "Where to show it", self._on_indicator_toggle
-        )
-        group.add(self.ind_battery_zone)
 
         self.ind_low_row = Adw.SpinRow.new_with_range(1, 100, 1)
         self.ind_low_row.set_title("Low battery at")
@@ -599,6 +612,13 @@ class LaptopKbdPage(Gtk.Box):
         self.ind_critical_row.set_subtitle("percent")
         self.ind_critical_row.connect("notify::value", self._on_indicator_toggle)
         group.add(self.ind_critical_row)
+
+        self.ind_charging_row = Adw.SwitchRow(
+            title="Charger",
+            subtitle="Green going in, amber coming out",
+        )
+        self.ind_charging_row.connect("notify::active", self._on_indicator_toggle)
+        group.add(self.ind_charging_row)
 
         self.ind_status_row = Adw.ActionRow(
             title="Showing now", subtitle="nothing"
@@ -614,15 +634,13 @@ class LaptopKbdPage(Gtk.Box):
         self._push_settings({"indicators": {
             "enabled": self.ind_enabled_row.get_active(),
             "when_off": self.ind_when_off_row.get_active(),
-            "profile": {
-                "enabled": self.ind_profile_row.get_active(),
-                "zone": self._zone_from_combo(self.ind_profile_zone),
-            },
+            "duration": round(self.ind_duration_row.get_value(), 1),
+            "profile": {"enabled": self.ind_profile_row.get_active()},
             "battery": {
                 "enabled": self.ind_battery_row.get_active(),
-                "zone": self._zone_from_combo(self.ind_battery_zone),
                 "low": low,
                 "critical": critical,
+                "show_charging": self.ind_charging_row.get_active(),
             },
         }})
 
@@ -708,15 +726,13 @@ class LaptopKbdPage(Gtk.Box):
         indicators = config["indicators"]
         self.ind_enabled_row.set_active(indicators["enabled"])
         self.ind_when_off_row.set_active(indicators["when_off"])
+        self.ind_duration_row.set_value(indicators["duration"])
         self.ind_profile_row.set_active(indicators["profile"]["enabled"])
-        self.ind_profile_zone.set_selected(
-            self._combo_index_for_zone(indicators["profile"]["zone"])
-        )
         battery = indicators["battery"]
         self.ind_battery_row.set_active(battery["enabled"])
-        self.ind_battery_zone.set_selected(self._combo_index_for_zone(battery["zone"]))
         self.ind_low_row.set_value(battery["low"])
         self.ind_critical_row.set_value(battery["critical"])
+        self.ind_charging_row.set_active(battery["show_charging"])
 
         saver = config["battery_saver"]
         self.saver_row.set_active(saver["enabled"])
@@ -730,12 +746,12 @@ class LaptopKbdPage(Gtk.Box):
         """Grey out what a switched-off section cannot use."""
         indicators = self._settings["indicators"]
         on = indicators["enabled"]
-        for widget in (self.ind_when_off_row, self.ind_profile_row,
-                       self.ind_battery_row, self.ind_status_row):
+        for widget in (self.ind_when_off_row, self.ind_duration_row,
+                       self.ind_profile_row, self.ind_battery_row,
+                       self.ind_charging_row, self.ind_status_row):
             widget.set_sensitive(on)
-        self.ind_profile_zone.set_sensitive(on and indicators["profile"]["enabled"])
         battery_on = on and indicators["battery"]["enabled"]
-        for widget in (self.ind_battery_zone, self.ind_low_row, self.ind_critical_row):
+        for widget in (self.ind_low_row, self.ind_critical_row):
             widget.set_sensitive(battery_on)
 
         saver_on = self._settings["battery_saver"]["enabled"]
@@ -762,8 +778,9 @@ class LaptopKbdPage(Gtk.Box):
     def _on_map(self, *_):
         self._refresh_status()
         if self._preview_timer_id is None:
+            self._preview_interval = self.PREVIEW_INTERVAL_MS
             self._preview_timer_id = GLib.timeout_add(
-                self.PREVIEW_INTERVAL_MS, self._preview_tick
+                self._preview_interval, self._preview_tick
             )
 
     def _on_unmap(self, *_):
@@ -799,15 +816,6 @@ class LaptopKbdPage(Gtk.Box):
         self.banner.set_revealed(not usable)
         self.set_sensitive_controls(usable)
 
-        shown = reply.get("indicators") or []
-        self.ind_status_row.set_subtitle(
-            ", ".join(item["label"] for item in shown) or "nothing"
-        )
-        # The preview has to keep ticking for a blinking or pulsing
-        # indicator even when the look itself is static or switched off.
-        self._indicators_animated = any(
-            item["style"] != "solid" for item in shown
-        )
         if reply.get("settings"):
             self._settings = reply["settings"]
         if reply.get("saving"):
@@ -859,14 +867,26 @@ class LaptopKbdPage(Gtk.Box):
 
     def _sync_control_visibility(self):
         """Show only what this look can use."""
-        animated = self._look["effect"] in kbd_backend.ANIMATED
-        self.speed_row.set_visible(animated)
+        effect = self._look["effect"]
+        self.speed_row.set_visible(effect in kbd_backend.ANIMATED)
         # Several effects paint their own hues and never read the zone
         # colours, so the pickers would be lying if they stayed live.
-        picks_colors = self._look["effect"] not in kbd_backend.COLOURLESS_EFFECTS
+        picks_colors = effect not in kbd_backend.COLOURLESS_EFFECTS
         self.zones_group.set_visible(picks_colors)
+        self.preview.set_clickable(picks_colors)
+
+        # The effects that run as one picture across the board fold WASD
+        # into the left zone, so its own picker has nothing to set. Greyed
+        # and labelled rather than hidden: a row that vanishes when you
+        # change effect reads as a bug, and the reason is worth saying.
+        merged = kbd_backend.merges_wasd(effect)
         for zone, (row, _button) in self._zone_rows.items():
             row.set_visible(zone < self._zones or self._zones == 1)
+            if zone == kbd_backend.ZONE_WASD:
+                row.set_sensitive(not merged)
+                row.set_subtitle(
+                    "Runs with the left zone for this effect" if merged else ""
+                )
 
     def _on_switch_changed(self, row, *_):
         if self._loading:
@@ -908,6 +928,48 @@ class LaptopKbdPage(Gtk.Box):
         self._loading = False
         self._look_changed()
 
+    def _on_preview_zone(self, _preview, zone):
+        """A band in the preview was clicked: pick that zone's colour.
+
+        Pointing at the part of the keyboard you mean is the whole of the
+        interaction -- no scrolling to a list and working out which of four
+        names the patch under your left hand answers to.
+        """
+        if self._look["effect"] in kbd_backend.COLOURLESS_EFFECTS:
+            self._show_toast(
+                f"{kbd_backend.EFFECT_LABELS[self._look['effect']]} paints its "
+                "own colours"
+            )
+            return
+        if zone == kbd_backend.ZONE_WASD and kbd_backend.merges_wasd(self._look["effect"]):
+            # The cluster is not drawn for these effects, but a click landing
+            # on where it would be should still do the obvious thing.
+            zone = kbd_backend.ZONE_LEFT
+        dialog = Gtk.ColorDialog(
+            with_alpha=False, title=f"{kbd_backend.ZONE_NAMES[zone]} zone"
+        )
+        dialog.choose_rgba(
+            self.get_root(), _hex_to_rgba(self._look["colors"][zone]), None,
+            self._on_preview_zone_picked, zone,
+        )
+
+    def _on_preview_zone_picked(self, dialog, result, zone):
+        try:
+            rgba = dialog.choose_rgba_finish(result)
+        except GLib.Error:
+            return      # dismissed, which is not a failure worth a toast
+        if rgba is None:
+            return
+        hexval = _rgba_to_hex(rgba)
+        if self._look["colors"][zone] == hexval:
+            return
+        self._look["colors"][zone] = hexval
+        self._look["on"] = True
+        # Through the loader so the zone's own picker button follows the
+        # click -- the two are the same setting and must not disagree.
+        self._load_look_into_controls()
+        self._look_changed()
+
     def _on_all_color_changed(self, button, *_):
         if self._loading:
             return
@@ -924,7 +986,9 @@ class LaptopKbdPage(Gtk.Box):
         self._look_changed()
 
     def _look_changed(self):
-        self.preview.set_look(self._look, self._zones, self._phase, self._settings)
+        self._alert = self.preview.set_look(
+            self._look, self._zones, self._phase, self._settings
+        )
         self._schedule_apply()
 
     # -- applying --
@@ -965,58 +1029,174 @@ class LaptopKbdPage(Gtk.Box):
     # -- preview --
 
     def _preview_tick(self):
-        """Run the drawn keyboard from the same frame function the daemon
+        """Run the drawn keyboard from the same frame function the service
         writes to the hardware, so the preview is the effect rather than an
-        impression of it."""
-        # A blinking indicator has to keep moving even with the lighting off,
-        # which is exactly the state the old condition called "nothing to
-        # animate".
+        impression of it.
+
+        The tick also polls for status flashes, so it cannot simply stop
+        when the look is static -- but it can slow right down, and it does
+        while there is nothing moving to draw.
+        """
+        # The phase is deliberately not advanced under an alert, matching
+        # the service: what comes back afterwards is the frame the effect
+        # was on, not the one it would have reached.
         animated = self._look["on"] and self._look["effect"] in kbd_backend.ANIMATED
-        if animated or self._indicators_animated:
+        if animated and self._alert is None:
             self._phase += kbd_backend.zones.PHASE_STEP * kbd_backend.zones.SPEED_FACTORS[
                 self._look["speed"]
             ]
-        self.preview.set_look(self._look, self._zones, self._phase, self._settings)
+        self._alert = self.preview.set_look(
+            self._look, self._zones, self._phase, self._settings
+        )
+        label = self._alert.label if self._alert is not None else "nothing"
+        if label != self.ind_status_row.get_subtitle():
+            self.ind_status_row.set_subtitle(label)
+
+        wanted = (self.PREVIEW_INTERVAL_MS if animated or self._alert is not None
+                  else self.PREVIEW_IDLE_MS)
+        if wanted != self._preview_interval:
+            self._preview_interval = wanted
+            self._preview_timer_id = GLib.timeout_add(wanted, self._preview_tick)
+            return False
         return True
 
 
 class _ZonePreview(Gtk.DrawingArea):
-    """The four zones as they sit on the keyboard: three bands across, with
-    the WASD cluster picked out over the left one."""
+    """The keyboard as it is lit: three bands across, with the WASD cluster
+    picked out over the left one -- except for the effects that run as one
+    picture across the board, where WASD belongs to the left band and drawing
+    it separately would be drawing a seam that is not there.
+
+    Clicking a band emits `zone-activated` with the zone it stands for, which
+    is how colours are changed: pointing at the part of the keyboard you mean
+    beats scrolling to a list and working out which name it has.
+    """
+
+    __gtype_name__ = "HyprUtilZonePreview"
+    __gsignals__ = {
+        "zone-activated": (GObject.SignalFlags.RUN_FIRST, None, (int,)),
+    }
+
+    PAD = 6
 
     def __init__(self, height=96):
         super().__init__()
         self._colors = []
         self._on = True
+        self._merged = False
+        self._alert = None
+        self._clickable = True
         self.set_content_height(height)
         self.set_hexpand(True)
         self.set_draw_func(self._draw)
 
+        click = Gtk.GestureClick()
+        click.connect("released", self._on_released)
+        self.add_controller(click)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_motion)
+        motion.connect("leave", self._on_leave)
+        self.add_controller(motion)
+        self._pointer_over = False
+        self.set_tooltip_text("Click a section to change its colour")
+
     def set_look(self, look, zones, phase, config=None):
-        # The composed frame, not the raw look: the preview has to show the
-        # indicators and the battery saver too, or it quietly disagrees with
-        # the keyboard sitting under the screen.
-        self._colors = kbd_backend.preview_frame(look, zones, phase, config)
-        self._on = kbd_backend.preview_lit(look, config, zones)
+        """Draw the frame the keyboard would be showing. Returns the alert.
+
+        The composed frame, not the raw look: the preview has to show an
+        alert and the battery saver too, or it quietly disagrees with the
+        keyboard sitting under the screen.
+        """
+        colors, lit, alert = kbd_backend.preview(look, zones, phase, config)
+        merged = kbd_backend.merges_wasd(look["effect"])
+        if (colors == self._colors and lit == self._on
+                and merged == self._merged and (alert is None) == (self._alert is None)):
+            # Eight times a second, most of them identical: a static look
+            # only changes when someone moves a control, and cairo does not
+            # need telling to repaint the same pixels.
+            return alert
+        self._colors, self._on = colors, lit
+        self._merged, self._alert = merged, alert
         self.queue_draw()
+        return alert
+
+    def set_clickable(self, clickable):
+        """Whether clicking a band means anything for the current effect."""
+        self._clickable = clickable
+        self.set_tooltip_text(
+            "Click a section to change its colour" if clickable
+            else "This effect paints its own colours"
+        )
 
     def _zone_color(self, zone):
         if zone < len(self._colors):
             return self._colors[zone]
         return self._colors[0] if self._colors else (0, 0, 0)
 
-    def _draw(self, _area, cr, width, height):
-        pad = 6
-        w, h = width - 2 * pad, height - 2 * pad
-        bands = [kbd_backend.ZONE_LEFT, kbd_backend.ZONE_MIDDLE, kbd_backend.ZONE_RIGHT]
+    # -- geometry, shared by the drawing and the hit test --
+
+    def _bands(self):
         if len(self._colors) == 1:
-            bands = [0, 0, 0]
+            return [0, 0, 0]
+        return [kbd_backend.ZONE_LEFT, kbd_backend.ZONE_MIDDLE, kbd_backend.ZONE_RIGHT]
+
+    def _cluster(self, step, h):
+        """Where the WASD patch sits, or None when it is not drawn.
+
+        Not drawn when the effect folds WASD into the left zone, and not
+        during an alert -- both of those are meant to read as one board.
+        """
+        if len(self._colors) <= kbd_backend.ZONE_WASD or self._merged or self._alert:
+            return None
+        cluster_w, cluster_h = min(74.0, step * 0.8), min(34.0, h * 0.42)
+        return (self.PAD + step * 0.5 - cluster_w / 2, self.PAD + h * 0.52,
+                cluster_w, cluster_h)
+
+    def _zone_at(self, x, y):
+        """Which zone the pointer is over, or None."""
+        pad = self.PAD
+        w, h = self.get_width() - 2 * pad, self.get_height() - 2 * pad
+        if w <= 0 or h <= 0 or not (pad <= x <= pad + w and pad <= y <= pad + h):
+            return None
+        bands = self._bands()
         step = w / len(bands)
+        cluster = self._cluster(step, h)
+        if cluster is not None:
+            cx, cy, cw, ch = cluster
+            if cx <= x <= cx + cw and cy <= y <= cy + ch:
+                return kbd_backend.ZONE_WASD
+        return bands[min(len(bands) - 1, int((x - pad) / step))]
+
+    def _on_released(self, gesture, n_press, x, y):
+        if not self._clickable or n_press != 1:
+            return
+        zone = self._zone_at(x, y)
+        if zone is not None:
+            self.emit("zone-activated", zone)
+
+    def _on_motion(self, _controller, x, y):
+        # Only on a change: motion fires per pixel of travel, and each
+        # set_cursor_from_name builds a fresh Gdk.Cursor.
+        over = bool(self._clickable and self._zone_at(x, y) is not None)
+        if over != self._pointer_over:
+            self._pointer_over = over
+            self.set_cursor_from_name("pointer" if over else None)
+
+    def _on_leave(self, _controller):
+        if self._pointer_over:
+            self._pointer_over = False
+            self.set_cursor_from_name(None)
+
+    def _draw(self, _area, cr, width, height):
+        pad = self.PAD
+        w, h = width - 2 * pad, height - 2 * pad
+        bands = self._bands()
+        step = w / len(bands)
+        alpha = 1.0 if self._on else 0.18
         _rounded_rect(cr, pad, pad, w, h, 10)
         cr.clip_preserve()
         for i, zone in enumerate(bands):
             r, g, b = self._zone_color(zone)
-            alpha = 1.0 if self._on else 0.18
             cr.set_source_rgba(r / 255, g / 255, b / 255, alpha)
             # +1 so neighbouring bands overlap by a subpixel; without it
             # antialiasing leaves a pale seam between them.
@@ -1024,13 +1204,12 @@ class _ZonePreview(Gtk.DrawingArea):
             cr.fill()
         cr.reset_clip()
 
-        if len(self._colors) > kbd_backend.ZONE_WASD:
+        cluster = self._cluster(step, h)
+        if cluster is not None:
+            x, y, cluster_w, cluster_h = cluster
             r, g, b = self._zone_color(kbd_backend.ZONE_WASD)
-            cluster_w, cluster_h = min(74.0, step * 0.8), min(34.0, h * 0.42)
-            x = pad + step * 0.5 - cluster_w / 2
-            y = pad + h * 0.52
             _rounded_rect(cr, x, y, cluster_w, cluster_h, 6)
-            cr.set_source_rgba(r / 255, g / 255, b / 255, 1.0 if self._on else 0.18)
+            cr.set_source_rgba(r / 255, g / 255, b / 255, alpha)
             cr.fill_preserve()
             cr.set_source_rgba(0, 0, 0, 0.35)
             cr.set_line_width(1)

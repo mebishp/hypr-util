@@ -55,6 +55,8 @@ def _run_kbd(args):
                     marks.append("animated")
                 if effect in kbd.COLOURLESS_EFFECTS:
                     marks.append("ignores your colours")
+                if kbd.merges_wasd(effect):
+                    marks.append("WASD runs with the left zone")
                 suffix = f"  [{', '.join(marks)}]" if marks else ""
                 print(f"{effect:<9} {kbd.EFFECT_DESCRIPTIONS[effect]}{suffix}")
             return
@@ -129,13 +131,12 @@ def _print_kbd_status(kbd):
         power += f", battery {battery}%{charge}"
     print(f"machine:    {power}")
 
-    shown = reply.get("indicators") or []
-    if shown:
-        print("indicators:")
-        for item in shown:
-            print(f"  {item['zone_name']:<7} #{item['color']}  {item['label']}")
+    alert = reply.get("alert")
+    if alert:
+        print(f"alert:      {alert['label']} -- the whole board #{alert['color']}"
+              f" ({alert['style']}), {alert['remaining']}s left")
     else:
-        print("indicators: none showing")
+        print("alert:      none (the board is showing the look)")
     if reply.get("error"):
         print(f"error:      {reply['error']}")
 
@@ -174,32 +175,36 @@ def _run_kbd_indicators(kbd, args):
         section["enabled"] = _kbd_bool(args.enabled)
     if args.when_off:
         section["when_off"] = _kbd_bool(args.when_off)
+    if args.duration is not None:
+        section["duration"] = args.duration
     if args.profile:
         section.setdefault("profile", {})["enabled"] = _kbd_bool(args.profile)
     if args.battery:
         section.setdefault("battery", {})["enabled"] = _kbd_bool(args.battery)
-    if args.profile_zone:
-        section.setdefault("profile", {})["zone"] = _kbd_zone_indices(args.profile_zone)[0]
-    if args.battery_zone:
-        section.setdefault("battery", {})["zone"] = _kbd_zone_indices(args.battery_zone)[0]
+    if args.charging:
+        section.setdefault("battery", {})["show_charging"] = _kbd_bool(args.charging)
     if args.low is not None:
         section.setdefault("battery", {})["low"] = args.low
     if args.critical is not None:
         section.setdefault("battery", {})["critical"] = args.critical
+    if args.repeat is not None:
+        section.setdefault("battery", {})["repeat_critical"] = args.repeat
 
     if section:
         kbd.update_settings(patch)
     config = kbd.read_settings()["indicators"]
     print(f"indicators:   {'on' if config['enabled'] else 'off'}")
     print(f"when off:     {'shown' if config['when_off'] else 'hidden'}")
-    print(f"power profile {'on' if config['profile']['enabled'] else 'off':<4}"
-          f" on the {kbd.ZONE_NAMES[config['profile']['zone']]} zone")
+    print(f"flash:        the whole board for {config['duration']:g}s,"
+          " then back to the look")
+    print(f"power profile {'on' if config['profile']['enabled'] else 'off'}")
     battery = config["battery"]
-    print(f"battery       {'on' if battery['enabled'] else 'off':<4}"
-          f" on the {kbd.ZONE_NAMES[battery['zone']]} zone,"
-          f" low at {battery['low']}%, critical at {battery['critical']}%")
-    showing = kbd.status().get("indicators") or []
-    print("showing now:  " + (", ".join(i["label"] for i in showing) or "nothing"))
+    print(f"battery       {'on' if battery['enabled'] else 'off'},"
+          f" low at {battery['low']}%, critical at {battery['critical']}%"
+          f" (repeating every {battery['repeat_critical']:g}s)")
+    print(f"charger       {'on' if battery['show_charging'] else 'off'}")
+    alert = kbd.status().get("alert")
+    print("showing now:  " + (alert["label"] if alert else "nothing"))
 
 
 def _run_kbd_saver(kbd, args):
@@ -271,17 +276,21 @@ def main(argv=None):
 
     kbd_ind = kbd_sub.add_parser(
         "indicators",
-        help="Status lights for the power profile and the battery",
+        help="Flash the whole board on a profile or battery change",
     )
     kbd_ind.add_argument("--enabled", choices=["on", "off"])
     kbd_ind.add_argument("--when-off", choices=["on", "off"], dest="when_off",
-                         help="keep showing them with the lighting switched off")
+                         help="flash even with the lighting switched off")
+    kbd_ind.add_argument("--duration", type=float, metavar="SECONDS",
+                         help="how long the board is held before the look comes back")
     kbd_ind.add_argument("--profile", choices=["on", "off"])
-    kbd_ind.add_argument("--profile-zone", help="all, left, middle, right or wasd")
     kbd_ind.add_argument("--battery", choices=["on", "off"])
-    kbd_ind.add_argument("--battery-zone", help="all, left, middle, right or wasd")
+    kbd_ind.add_argument("--charging", choices=["on", "off"],
+                         help="flash when the charger goes in or out")
     kbd_ind.add_argument("--low", type=int, metavar="PCT", help="low battery threshold")
     kbd_ind.add_argument("--critical", type=int, metavar="PCT")
+    kbd_ind.add_argument("--repeat", type=float, metavar="SECONDS",
+                         help="how often a critical battery says so again")
 
     kbd_saver = kbd_sub.add_parser("saver", help="Dim the keyboard on battery")
     kbd_saver.add_argument("--enabled", choices=["on", "off"])

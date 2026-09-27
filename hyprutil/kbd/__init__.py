@@ -26,6 +26,7 @@ from .zones import (
     EFFECTS,
     EFFECT_LABELS,
     FACTORY_COLORS,
+    MERGE_WASD,
     SPEED_MAX,
     SPEED_MIN,
     ZONE_LEFT,
@@ -34,6 +35,7 @@ from .zones import (
     ZONE_RIGHT,
     ZONE_WASD,
     frame_colors,
+    merges_wasd,
     normalize_look,
     to_hex,
     to_rgb,
@@ -43,13 +45,13 @@ from .zones import (
 __all__ = [
     "ANIMATED", "BRIGHTNESS_MAX", "COLOURLESS_EFFECTS", "DEFAULT_BRIGHTNESS",
     "DEFAULT_LOOK", "DEFAULT_SPEED", "DISPLAY_ORDER", "EFFECTS", "EFFECT_DESCRIPTIONS",
-    "EFFECT_LABELS", "FACTORY_COLORS", "SPEED_MAX", "SPEED_MIN",
+    "EFFECT_LABELS", "FACTORY_COLORS", "MERGE_WASD", "SPEED_MAX", "SPEED_MIN",
     "ZONE_LEFT", "ZONE_MIDDLE", "ZONE_NAMES", "ZONE_RIGHT", "ZONE_WASD",
     "DeviceError", "DeviceUnavailable",
     "apply", "apply_preset", "available", "device", "effects", "frame_colors",
-    "indicators", "normalize_look", "presets", "preview_frame",
-    "probe", "read_current", "read_settings", "reload", "save_preset", "settings",
-    "preview_lit", "state", "status", "sysinfo", "to_hex", "to_rgb",
+    "indicators", "merges_wasd", "normalize_look", "presets",
+    "preview", "probe", "read_current", "read_settings", "reload", "save_preset",
+    "settings", "state", "status", "sysinfo", "to_hex", "to_rgb",
     "update_settings",
     "write_current", "zone_colors", "zones",
 ]
@@ -65,22 +67,25 @@ def _keyboard_or_raise():
     return keyboard
 
 
-def _render_context(look, config=None, zone_count=4, force_status=False):
-    """Everything a frame needs: the effective look, and what to hold over it.
+def _render_context(look, config=None, zone_count=4):
+    """Everything a frame needs: the effective look, and any live alert.
 
-    Shared by apply(), reload() and the UI preview so that all three agree
-    about what the keyboard should be showing -- a preview that ignored the
-    battery saver, or an apply that dropped the indicators, would each be a
-    quiet lie.
+    Shared by apply(), reload(), status() and the UI preview so that all of
+    them agree about what the keyboard should be showing -- a preview that
+    ignored the battery saver, or an apply that dropped an alert mid-flash,
+    would each be a quiet lie.
+
+    The alert comes from the process-wide monitor, so asking twice in one
+    frame does not fire anything twice.
     """
     config = config if config is not None else settings.read()
     look = normalize_look(look)
     telemetry = sysinfo.telemetry()
-    overlays = indicators.build(
-        config["indicators"], telemetry, zone_count, look["on"],
+    alert = indicators.monitor().update(
+        config["indicators"], telemetry, look["on"],
     )
     effective = zones.apply_battery_saver(look, config["battery_saver"], telemetry)
-    return effective, overlays, telemetry, config
+    return effective, alert, telemetry, config
 
 
 def status():
@@ -93,13 +98,8 @@ def status():
         except DeviceError:
             lit = None
     look = read_current()
-    config = settings.read()
     zone_count = (keyboard or {}).get("zones") or 4
-    telemetry = sysinfo.telemetry()
-    overlays = indicators.build(
-        config["indicators"], telemetry, zone_count, look["on"],
-    )
-    effective = zones.apply_battery_saver(look, config["battery_saver"], telemetry)
+    effective, alert, telemetry, config = _render_context(look, zone_count=zone_count)
     return {
         "ok": True,
         "keyboard": keyboard,
@@ -108,7 +108,7 @@ def status():
         "saving": effective != look,
         "settings": config,
         "telemetry": telemetry,
-        "indicators": [o.as_dict() for o in overlays],
+        "alert": alert.as_dict() if alert is not None else None,
         "lit": lit,
         "error": None if device.present() else device.explain(),
     }
@@ -132,11 +132,11 @@ def apply(look):
     """
     look = write_current(look)
     keyboard = _keyboard_or_raise()
-    effective, overlays, telemetry, _ = _render_context(
+    effective, alert, telemetry, _ = _render_context(
         look, zone_count=keyboard["zones"]
     )
     zones.apply_look(
-        effective, keyboard["zones"], overlays=overlays, telemetry=telemetry
+        effective, keyboard["zones"], alert=alert, telemetry=telemetry
     )
     return status()
 
@@ -149,11 +149,11 @@ def reload():
     last set.
     """
     keyboard = _keyboard_or_raise()
-    effective, overlays, telemetry, _ = _render_context(
+    effective, alert, telemetry, _ = _render_context(
         read_current(), zone_count=keyboard["zones"]
     )
     zones.apply_look(
-        effective, keyboard["zones"], overlays=overlays, telemetry=telemetry
+        effective, keyboard["zones"], alert=alert, telemetry=telemetry
     )
     return status()
 
@@ -187,10 +187,10 @@ def probe():
     return out
 
 
-# -- settings and presets --
+# -- settings, presets, and the other keyboard --
 
 def read_settings():
-    """Indicators and battery saver."""
+    """Indicators, battery saver and keyboard matching."""
     return settings.read()
 
 
@@ -232,24 +232,23 @@ def save_preset(slot, look=None, name=None):
     return presets.write(slot, look if look is not None else read_current(), name=name)
 
 
-def preview_frame(look, zone_count=4, phase=0.0, config=None):
-    """The colours the keyboard would be showing, for the UI to draw.
+def preview(look, zone_count=4, phase=0.0, config=None):
+    """What the keyboard would be showing, for the UI to draw.
 
-    Goes through the same composition as the hardware path, so what the
-    preview shows includes the indicators and the battery saver rather than
-    only the look the user is editing.
+    Returns (colours, lit, alert). Goes through the same composition as the
+    hardware path, so the preview includes an alert and the battery saver
+    rather than only the look being edited.
 
-    `config` lets a caller redrawing at 8 frames a second hand in the
-    settings it already holds, rather than making this re-read and re-parse
-    the file for every frame.
+    One call rather than the pair this replaced: the preview redraws eight
+    times a second, and each of those used to build the whole render context
+    twice -- two telemetry samples, two normalizations, two passes over the
+    indicator config -- to answer two questions about the same frame.
+
+    `config` lets that caller hand in the settings it already holds rather
+    than making this re-read and re-parse the file for every frame.
     """
-    effective, overlays, telemetry, _ = _render_context(
+    effective, alert, telemetry, _ = _render_context(
         look, config=config, zone_count=zone_count
     )
-    return zones.compose(effective, zone_count, phase, overlays, telemetry)
-
-
-def preview_lit(look, config=None, zone_count=4):
-    """Whether the backlight would be on, for the preview to dim itself."""
-    _, overlays, _, _ = _render_context(look, config=config, zone_count=zone_count)
-    return zones.backlight_wanted(look, overlays)
+    colors = zones.compose(effective, zone_count, phase, alert, telemetry)
+    return colors, zones.backlight_wanted(effective, alert), alert
