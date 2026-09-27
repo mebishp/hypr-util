@@ -1,7 +1,7 @@
 """hyprutil: unified command-line entry point.
 
-Dispatches to the settings app, tray icon, automation daemon, the laptop
-keyboard lighting service, or a one-off RGB flash test.
+Dispatches to the settings app, tray icon, automation daemon, or the
+keyboard lighting service.
 """
 import argparse
 import json
@@ -16,31 +16,6 @@ def _run_tray(args):
 def _run_daemon(args):
     from .automation import main
     main()
-
-
-def _run_flash(args):
-    from .rgb import controller, notify, presets
-
-    if args.list_effects:
-        print("\n".join(controller.EFFECTS))
-        return
-
-    if args.effect is None or args.color is None or args.duration is None:
-        print(
-            "usage: hyprutil flash <effect> <hexcolor> <duration_seconds> [color_idx]",
-            file=sys.stderr,
-        )
-        print(f"available effects: {', '.join(controller.EFFECTS)}", file=sys.stderr)
-        sys.exit(1)
-
-    slot = presets.active_preset()
-    print(f"current active preset: {presets.read_preset(slot)['name'] if slot else '(none)'}")
-    print(
-        f"flashing effect={args.effect!r} color=#{args.color} "
-        f"color_idx={args.color_idx} for {args.duration}s..."
-    )
-    notify.flash(args.effect, args.color, args.duration, args.color_idx)
-    print("reverted")
 
 
 def _run_kbd_effects(args):
@@ -98,9 +73,6 @@ def _run_kbd(args):
             return
         if args.kbd_command == "saver":
             _run_kbd_saver(kbd, args)
-            return
-        if args.kbd_command == "match":
-            _run_kbd_match(kbd, args)
             return
 
         look = dict(kbd.read_current())
@@ -250,28 +222,6 @@ def _run_kbd_saver(kbd, args):
           + (" -- saver active" if config["enabled"] and where == "battery" else ""))
 
 
-def _run_kbd_match(kbd, args):
-    patch = {}
-    if args.enabled:
-        patch["enabled"] = _kbd_bool(args.enabled)
-    if args.zone:
-        patch["source_zone"] = _kbd_zone_indices(args.zone)[0]
-    if args.effect:
-        patch["match_effect"] = _kbd_bool(args.effect)
-    if patch:
-        kbd.update_settings({"sync": patch})
-    config = kbd.read_settings()["sync"]
-    print(f"match the Firefly: {'on' if config['enabled'] else 'off'}"
-          f", from the {kbd.ZONE_NAMES[config['source_zone']]} zone"
-          f", effect {'matched' if config['match_effect'] else 'left alone'}")
-    if args.now:
-        sent = kbd.match_firefly()
-        if sent:
-            print(f"  sent: {sent['effect']} #{sent['color']}")
-        else:
-            print("  the Firefly is not connected")
-
-
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else list(argv)
 
@@ -339,15 +289,6 @@ def main(argv=None):
     kbd_saver.add_argument("--static-only", choices=["on", "off"], dest="static_only",
                            help="stop animations while on battery")
 
-    kbd_match = kbd_sub.add_parser(
-        "match", help="Make the external Firefly follow this keyboard's colour"
-    )
-    kbd_match.add_argument("--enabled", choices=["on", "off"])
-    kbd_match.add_argument("--zone", help="which zone's colour to copy")
-    kbd_match.add_argument("--effect", choices=["on", "off"],
-                           help="also translate the effect, not just the colour")
-    kbd_match.add_argument("--now", action="store_true", help="push a match right now")
-
     kbd_parser.set_defaults(func=_run_kbd)
 
     kbd_sub.add_parser(
@@ -357,14 +298,6 @@ def main(argv=None):
     sub.add_parser(
         "kbd-effects", help="Run the keyboard effect animation (systemd starts this)"
     ).set_defaults(func=_run_kbd_effects)
-
-    flash_parser = sub.add_parser("flash", help="Manually apply an RGB effect/color, then revert")
-    flash_parser.add_argument("effect", nargs="?")
-    flash_parser.add_argument("color", nargs="?", help="hex color, e.g. ff0000")
-    flash_parser.add_argument("duration", nargs="?", type=float)
-    flash_parser.add_argument("color_idx", nargs="?", type=int, default=7)
-    flash_parser.add_argument("--list-effects", action="store_true")
-    flash_parser.set_defaults(func=_run_flash)
 
     args = parser.parse_args(argv)
     args.func(args)

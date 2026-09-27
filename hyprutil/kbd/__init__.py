@@ -1,9 +1,6 @@
 """The laptop's own keyboard lighting: four zones, straight through sysfs.
 
-This is the HP OMEN keyboard built into the machine, not the external
-Firefly (that one is USB HID and lives in hyprutil/rgb/). The two are
-deliberately separate: they share no protocol, no state and no failure mode,
-and the only thing they have in common is that both are keyboards.
+This is the HP OMEN keyboard built into the machine.
 
 The privileged part -- one ACPI-WMI call into the BIOS mailbox -- belongs to
 the hyprkbd kernel module in kernel/hyprkbd/, and a udev rule hands its sysfs
@@ -13,7 +10,7 @@ socket. The effect animation is the one thing that must outlive the app, and
 it lives in effects.py as a user service.
 """
 from . import (
-    device, effects, indicators, presets, settings, state, sync, sysinfo, zones,
+    device, effects, indicators, presets, settings, state, sysinfo, zones,
 )
 from .device import DeviceError, DeviceUnavailable
 from .state import read_current, write_current
@@ -50,9 +47,9 @@ __all__ = [
     "ZONE_LEFT", "ZONE_MIDDLE", "ZONE_NAMES", "ZONE_RIGHT", "ZONE_WASD",
     "DeviceError", "DeviceUnavailable",
     "apply", "apply_preset", "available", "device", "effects", "frame_colors",
-    "indicators", "match_firefly", "normalize_look", "presets", "preview_frame",
+    "indicators", "normalize_look", "presets", "preview_frame",
     "probe", "read_current", "read_settings", "reload", "save_preset", "settings",
-    "preview_lit", "state", "status", "sync", "sysinfo", "to_hex", "to_rgb",
+    "preview_lit", "state", "status", "sysinfo", "to_hex", "to_rgb",
     "update_settings",
     "write_current", "zone_colors", "zones",
 ]
@@ -135,13 +132,12 @@ def apply(look):
     """
     look = write_current(look)
     keyboard = _keyboard_or_raise()
-    effective, overlays, telemetry, config = _render_context(
+    effective, overlays, telemetry, _ = _render_context(
         look, zone_count=keyboard["zones"]
     )
     zones.apply_look(
         effective, keyboard["zones"], overlays=overlays, telemetry=telemetry
     )
-    sync.push(look, config["sync"])
     return status()
 
 
@@ -191,10 +187,10 @@ def probe():
     return out
 
 
-# -- settings, presets, and the other keyboard --
+# -- settings and presets --
 
 def read_settings():
-    """Indicators, battery saver and keyboard matching."""
+    """Indicators and battery saver."""
     return settings.read()
 
 
@@ -234,18 +230,6 @@ def apply_preset(slot):
 def save_preset(slot, look=None, name=None):
     """Store a look (the current one, by default) into a preset slot."""
     return presets.write(slot, look if look is not None else read_current(), name=name)
-
-
-def match_firefly(look=None):
-    """Push the laptop keyboard's colour to the external Firefly now.
-
-    Used by the "match now" action, which works whether or not automatic
-    matching is switched on -- so someone can try it once before committing
-    to having it happen on every change.
-    """
-    config = dict(settings.read()["sync"])
-    config["enabled"] = True
-    return sync.push(look if look is not None else read_current(), config)
 
 
 def preview_frame(look, zone_count=4, phase=0.0, config=None):

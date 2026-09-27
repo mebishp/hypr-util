@@ -1,9 +1,5 @@
 """Named looks for the laptop keyboard, in four slots.
 
-The external Firefly has had presets since the beginning (hyprutil/rgb/
-presets.py); this is the same idea for the built-in keyboard, and the same
-shape of file, so the two pages of the settings app behave alike.
-
 A slot holds a whole look -- effect, four colours, brightness, speed -- plus
 a name. Applying one writes it to current.json like any other change, so the
 effects service picks it up and the keyboard follows with no extra plumbing.

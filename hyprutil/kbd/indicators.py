@@ -8,10 +8,6 @@ the board reads as dark with one status light. A zone set to 000000 on this
 hardware is genuinely dark, which is what makes that honest rather than a
 dim glow pretending to be off.
 
-Colours are the ones hyprutil/rgb/notify.py already flashes on the external
-Firefly for the same events, so the two keyboards say the same thing in the
-same colours.
-
 When two indicators want the same zone, the higher priority wins outright
 rather than blending -- a blend of "battery critical" and "performance mode"
 is a colour that means neither.

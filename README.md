@@ -2,16 +2,15 @@
 
 <img src="system/icons/hicolor/scalable/apps/org.hyprnon.hyprutil.svg" width="106" height="106" alt="hypr-util icon">
 
-Fan curve and keyboard RGB control for HP Omen laptop and Cosmic Byte Firefly
+Fan curve and keyboard backlight control for HP Omen laptops
 
-Two keyboards, two protocols: the laptop's own four-zone backlight through
-the HP BIOS mailbox, and the external Firefly through its USB HID interface.
+The laptop's own four-zone keyboard backlight, driven through the HP BIOS
+mailbox, and a multi-point fan curve that follows the power profile.
 
 ## Parts
 
-- `hyprutil/`: the Python package -- fan curve, RGB presets, display refresh rate, the GTK4/Adwaita settings window and PyQt6 tray under `hyprutil/ui/`, and the automation daemon
-- `hyprutil/rgb/device.py`: the Firefly's HID protocol, spoken directly to its hidraw node -- no helper binary, no libusb, no setcap
-- `hyprutil/kbd/`: the laptop's own four-zone keyboard -- the driver's sysfs files (`device.py`), the lighting model and ten effects (`zones.py`), the animation service (`effects.py`), status lights (`indicators.py` over `sysinfo.py`), saved looks (`presets.py`), and the translation to the Firefly (`sync.py`)
+- `hyprutil/`: the Python package -- fan curve, display refresh rate, the GTK4/Adwaita settings window and PyQt6 tray under `hyprutil/ui/`, and the automation daemon
+- `hyprutil/kbd/`: the laptop's four-zone keyboard -- the driver's sysfs files (`device.py`), the lighting model and ten effects (`zones.py`), the animation service (`effects.py`), status lights (`indicators.py` over `sysinfo.py`), and saved looks (`presets.py`)
 - `kernel/hyprkbd/`: the DKMS kernel module that carries the laptop keyboard's colours, so nothing above it needs root
 - `bin/hyprutil`: run-from-checkout launcher, for working on the code without installing
 - `system/`: everything installed outside the repo, in subdirectories named for where it goes (`bin/`, `dbus/`, `desktop/`, `icons/`, `modules-load/`, `sleep/`, `systemd/`, `udev/`)
@@ -43,9 +42,8 @@ Removes everything setup.sh installed. Settings in `~/.config/hypr-util` are kep
 hyprutil app       # settings window
 hyprutil tray      # tray icon
 hyprutil daemon    # automation daemon
-hyprutil flash     # one-off Firefly RGB test
 
-hyprutil kbd status                          # the laptop keyboard's four zones
+hyprutil kbd status                          # the keyboard's four zones
 hyprutil kbd probe                           # why it is not working
 hyprutil kbd set --color ff0000 --zone wasd
 hyprutil kbd set --effect wave --speed 4
@@ -58,7 +56,6 @@ hyprutil kbd preset 3                        # apply one
 hyprutil kbd preset --save 3 --name Ember    # save the current look into one
 hyprutil kbd indicators --battery on --low 20
 hyprutil kbd saver --enabled on --brightness 30
-hyprutil kbd match --enabled on --now        # make the Firefly follow this keyboard
 ```
 
 None of these need root. `hyprutil kbd probe` is the one to run when
@@ -195,9 +192,7 @@ service idles through them rather than waking eight times a second.
 
 ### Indicators
 
-A zone can be held aside to show what the machine is doing. The colours are
-the ones the external Firefly already flashes for the same events, so the
-two keyboards say the same thing.
+A zone can be held aside to show what the machine is doing.
 
 | | |
 |---|---|
@@ -228,19 +223,6 @@ An unknown power source (a desktop, a VM, no mains adapter in `/sys`) counts
 as mains. Dimming someone's keyboard because we could not find out whether
 they were on battery would be the wrong way to be wrong.
 
-### Matching the two keyboards
-
-The laptop's keyboard and the Firefly have nothing in common at the hardware
-level, so matching them is a translation, in `kbd/sync.py`. The colour is the
-part that translates exactly: one zone is nominated as the source and the
-Firefly is set to it. The effect is a best-effort correspondence between two
-sets of animations designed by different people for different hardware,
-which is why matching it is a separate switch.
-
-Two scales run opposite ways and are easy to get wrong: the laptop's speed
-is 1-5 with 5 fastest, the Firefly's is 1-7 with 1 fastest. `_speed()` in
-that module is the only place that knows.
-
 ### Presets
 
 Four named slots holding a whole look -- effect, four colours, brightness and
@@ -262,37 +244,3 @@ It needs your kernel's headers, and it follows whatever compiler built the
 running kernel -- a Clang-built kernel (CachyOS ships one) rejects a
 GCC-built module.
 
-## Firefly protocol
-
-The Cosmic Byte Firefly (USB `04d9:a1cd`) exposes a vendor HID collection on
-interface 2: 8-byte Feature reports carry commands, a 64-byte Output report
-carries bulk payloads, and a Feature read returns the reply. Bulk reads are
-command, then ack, then read -- the ack is required or the device sends
-nothing.
-
-`0x08 SetLEDType` takes seven parameters, named by the vendor software as
-`type, brightness, speed, direction, color, bl0, bl1`:
-
-| byte | meaning | range |
-|---|---|---|
-| type | effect | 0-11 |
-| brightness | | 0-63 |
-| speed | 1 fastest, 7 slowest | 1-7 |
-| direction | only used by wave and wave2 | 0 right, 1 left |
-| color | palette slot, or 7 for the device's own rainbow | 0-7 |
-| bl0/bl1 | device-owned; read with `0x88` and echoed back | |
-
-Colour works one slot at a time: the keyboard holds seven colours and an
-effect shows exactly one of them, or ignores them entirely on 7 (LOOP).
-There is no "cycle through my colours" mode.
-
-The keyboard also holds three lighting profiles of its own (`0x21`), which
-the first three presets are bound to so their lighting survives with nothing
-running.
-
-Do not probe this device with unlisted opcodes -- `0x0F` is
-SetISPBootLoader.
-
-## Acknowledgement
-
-https://github.com/Arjun31415/Firefly-cli

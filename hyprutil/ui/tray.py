@@ -17,14 +17,13 @@ gi.require_version("GLib", "2.0")
 gi.require_version("Gio", "2.0")
 from gi.repository import Gio, GLib
 
-from PyQt6.QtCore import QRectF, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPainterPath, QPixmap
+from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from .. import fan as core
 from .. import kbd
 from .. import power
-from .. import rgb
 
 logger = logging.getLogger(__name__)
 
@@ -72,40 +71,6 @@ def make_icon(temp):
     return pixmap
 
 
-def make_palette_icon(palette, width=32, height=16):
-    """A preset's colours as a small stripe swatch for its menu entry.
-
-    The tray used to list four entries named "Preset 1".."Preset 4" with
-    nothing to tell them apart, so picking one was guesswork until the
-    keyboard changed. One stripe is a solid colour, several mean it cycles,
-    and an empty outline means the effect animates its own colours and
-    ignores the palette entirely.
-    """
-    palette = list(palette)
-    pixmap = QPixmap(width * 2, height * 2)
-    pixmap.setDevicePixelRatio(2.0)
-    pixmap.fill(QColor(0, 0, 0, 0))
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    path = QPainterPath()
-    path.addRoundedRect(QRectF(0.5, 0.5, width - 1, height - 1), 3, 3)
-    if palette:
-        painter.setClipPath(path)
-        step = width / len(palette)
-        for i, hexval in enumerate(palette):
-            # +1 on the width so neighbouring stripes overlap by a subpixel
-            # and antialiasing leaves no pale seam between them.
-            painter.fillRect(QRectF(i * step, 0, step + 1, height), QColor(f"#{hexval}"))
-        painter.setClipping(False)
-    painter.setPen(QColor(0, 0, 0, 60))
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    painter.drawPath(path)
-    if not palette:
-        painter.drawLine(3, height - 3, width - 3, 3)
-    painter.end()
-    return QIcon(pixmap)
-
-
 class FanTray(QSystemTrayIcon):
     # service_active() is a D-Bus round trip; gathering it (plus the hwmon
     # reads) happens on a worker thread and this signal hands the results
@@ -145,37 +110,10 @@ class FanTray(QSystemTrayIcon):
         self._actions.append(profile_menu)
 
         self.menu.addSeparator()
-        self.rgb_preset_actions = {}
-        rgb_menu = QMenu("Keyboard RGB")
-        for slot in rgb.PRESET_SLOTS:
-            # Label and swatch are filled in by _apply_status, which refreshes
-            # them every poll -- presets can be renamed or re-saved in the
-            # settings app while this menu already exists.
-            act = self._make_action(
-                "", checkable=True, slot=lambda checked, s=slot: self.apply_rgb_preset(s)
-            )
-            rgb_menu.addAction(act)
-            self.rgb_preset_actions[slot] = act
-        self.menu.addMenu(rgb_menu)
-        self._actions.append(rgb_menu)
-
-        # Brightness is the one lighting setting worth reaching without
-        # opening the settings window at all -- it is what you change when
-        # the room gets dark, not something you sit down to configure.
-        brightness_menu = QMenu("Brightness")
-        for label, percent in (("Off", 0), ("25%", 25), ("50%", 50), ("75%", 75), ("Full", 100)):
-            act = self._make_action(
-                label, slot=lambda checked, pct=percent: self.set_brightness(pct)
-            )
-            brightness_menu.addAction(act)
-        self.menu.addMenu(brightness_menu)
-        self._actions.append(brightness_menu)
-
-        # The laptop's own keyboard, which is a different device from the
-        # Firefly above it: four zones behind the BIOS mailbox, reached
-        # through the hyprkbd driver's sysfs files. Disabled until the
-        # driver answers, so a click cannot silently do nothing.
-        self.kbd_menu = QMenu("Laptop Keyboard")
+        # Four zones behind the BIOS mailbox, reached through the hyprkbd
+        # driver's sysfs files. Disabled until the driver answers, so a click
+        # cannot silently do nothing.
+        self.kbd_menu = QMenu("Keyboard")
         self.kbd_menu.setEnabled(False)
         self.kbd_menu.addAction(
             self._make_action("Backlight on", slot=lambda checked: self.set_kbd(on=True))
@@ -272,30 +210,6 @@ class FanTray(QSystemTrayIcon):
         except GLib.Error:
             subprocess.Popen([APP_LAUNCHER, "app"])
 
-    def set_brightness(self, percent):
-        threading.Thread(target=self._set_brightness_worker, args=(percent,), daemon=True).start()
-
-    def _set_brightness_worker(self, percent):
-        try:
-            look = rgb.read_current()
-            look["brightness"] = round(percent * rgb.BRIGHTNESS_MAX / 100)
-            rgb.apply_current(look)
-        except Exception:
-            logger.exception("failed to set brightness to %d%%", percent)
-
-    def apply_rgb_preset(self, slot):
-        # rgb.apply_preset() paces several HID messages to the keyboard and
-        # takes a couple of hundred milliseconds -- do it off the Qt main
-        # thread so a menu click doesn't freeze the UI.
-        threading.Thread(target=self._apply_rgb_preset_worker, args=(slot,), daemon=True).start()
-
-    def _apply_rgb_preset_worker(self, slot):
-        if rgb.ready():
-            try:
-                rgb.apply_preset(slot)
-            except Exception:
-                logger.exception("failed to apply RGB preset %r", slot)
-
     def set_kbd(self, on=None, effect=None):
         threading.Thread(
             target=self._set_kbd_worker, args=(on, effect), daemon=True
@@ -338,10 +252,10 @@ class FanTray(QSystemTrayIcon):
         threading.Thread(target=self._gather_status, daemon=True).start()
 
     def _gather_status(self):
-        # Reacting to power-profile changes (display refresh rate, RGB flash)
-        # is handled by the always-on automation daemon (hyprutil/automation.py),
-        # not here -- that way it keeps working even when the tray isn't
-        # running. This loop only displays status and drives manual actions.
+        # Reacting to power-profile changes (display refresh rate) is handled
+        # by the always-on automation daemon (hyprutil/automation.py), not
+        # here -- that way it keeps working even when the tray isn't running.
+        # This loop only displays status and drives manual actions.
         # `active` is read purely for the status line; starting/stopping the
         # fan daemon lives in the settings app, since it needs a pkexec
         # password prompt that a tray menu is a poor place to trigger.
@@ -349,13 +263,10 @@ class FanTray(QSystemTrayIcon):
             s = core.read_status()
             active = power.service_active(core.SERVICE)
             override = core.read_override()
-            active_slot = rgb.active_preset()
-            presets = {slot: rgb.read_preset(slot) for slot in rgb.PRESET_SLOTS}
 
             self._status_ready.emit({
                 "temp": s["temp"], "pwm": s["pwm"], "fan1": s["fan1"], "fan2": s["fan2"],
-                "active": active, "override": override, "active_slot": active_slot,
-                "presets": presets, "kbd": kbd.available(),
+                "active": active, "override": override, "kbd": kbd.available(),
             })
         finally:
             self._refreshing = False
@@ -363,17 +274,6 @@ class FanTray(QSystemTrayIcon):
     def _apply_status(self, data):
         self._last_status = data
         self.setIcon(QIcon(make_icon(data["temp"])))
-
-        for slot, act in self.rgb_preset_actions.items():
-            preset = data["presets"][slot]
-            act.setText(preset["name"])
-            # Blank swatch for effects that ignore colour, rather than
-            # advertising colours the keyboard will not show.
-            act.setIcon(make_palette_icon(rgb.look_colors(preset)))
-            # Unchecked across the board when a hand-edited look is on the
-            # keyboard, rather than leaving a tick on whichever preset was
-            # applied last -- that tick used to outlive the colours it named.
-            act.setChecked(slot == data["active_slot"])
 
         self.kbd_menu.setEnabled(bool(data.get("kbd")))
 
@@ -430,7 +330,6 @@ def main():
         print("Could not find hp or k10temp hwmon devices", file=sys.stderr)
         sys.exit(1)
     core.ensure_config_defaults()
-    rgb.ensure_defaults()
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

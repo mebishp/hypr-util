@@ -15,8 +15,7 @@
 #   /etc/systemd/system/                hypr-util-fancurve.service
 #                                       hypr-util-kbd.service
 #   /etc/systemd/system-sleep/hypr-util suspend/resume hook
-#   /etc/udev/rules.d/                  99-firefly-keyboard.rules
-#                                       99-hyprkbd.rules
+#   /etc/udev/rules.d/                  99-hyprkbd.rules
 #   ~/.config/systemd/user/             hypr-util-{daemon,tray}.service
 #                                       hypr-util-kbd-effects.service
 #   ~/.local/share/applications/        desktop entry
@@ -117,7 +116,8 @@ remove_legacy() {
 	sudo rm -f \
 		/etc/systemd/system/fancurve.service \
 		/usr/local/bin/fancurve.sh \
-		/usr/lib/systemd/system-sleep/hypr-util
+		/usr/lib/systemd/system-sleep/hypr-util \
+		/etc/udev/rules.d/99-firefly-keyboard.rules
 	rm -f \
 		"$CONFIG_DIR/autostart/hypr-util.desktop" \
 		"$CONFIG_DIR/autostart/hyprnonfan.desktop" \
@@ -175,7 +175,7 @@ install_kernel_module() {
 install_program() {
 	log "installing program files into $PREFIX"
 	# Wipe the whole directory rather than just the package: it also used to
-	# hold the firefly-ctl helper binary, which no longer exists.
+	# hold a helper binary that no longer exists.
 	sudo rm -rf "$LIBDIR"
 	sudo install -d -m 755 "$LIBDIR"
 	sudo cp -r "$REPO_DIR/hyprutil" "$LIBDIR/hyprutil"
@@ -190,7 +190,6 @@ install_program() {
 
 install_system_units() {
 	log "installing system units and rules"
-	sudo install -D -m 644 "$SRC/udev/99-firefly-keyboard.rules" /etc/udev/rules.d/99-firefly-keyboard.rules
 	# Rendered, not copied: it carries the uid this install is for.
 	render_install 644 "$SRC/udev/99-hyprkbd.rules" /etc/udev/rules.d/99-hyprkbd.rules sudo
 	sudo install -D -m 755 "$SRC/sleep/hypr-util" /etc/systemd/system-sleep/hypr-util

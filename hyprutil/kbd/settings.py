@@ -2,9 +2,8 @@
 
 The look -- colours, effect, brightness -- changes constantly and lives in
 current.json, which the effects service watches. This is the other half:
-which indicators are on, what the battery thresholds are, whether the two
-keyboards follow each other. It changes rarely, so it is a separate file
-that nothing polls in a hot loop.
+which indicators are on and what the battery thresholds are. It changes
+rarely, so it is a separate file that nothing polls in a hot loop.
 
 Written by the settings app and the CLI, read by both of those and by the
 effects service.
@@ -45,13 +44,6 @@ DEFAULTS = {
         "brightness": 40,
         "static_only": True,
     },
-    "sync": {
-        # Make the external Firefly follow the laptop keyboard's colour, so
-        # the two do not disagree about what colour the machine is.
-        "enabled": False,
-        "source_zone": zones.ZONE_LEFT,
-        "match_effect": True,
-    },
 }
 
 
@@ -68,8 +60,8 @@ def _merge(defaults, data):
     """Defaults, with `data` laid over it one level at a time.
 
     A plain dict.update would let a half-written file drop whole sections;
-    merging key by key means a file that only says {"sync": {"enabled":
-    true}} still gets every other default.
+    merging key by key means a file that only says {"battery_saver":
+    {"enabled": true}} still gets every other default.
     """
     out = {}
     for key, fallback in defaults.items():
@@ -104,8 +96,6 @@ def normalize(data):
         out[section][key]["zone"] = zone
     saver = out["battery_saver"]
     saver["brightness"] = max(0, min(zones.BRIGHTNESS_MAX, saver["brightness"]))
-    if out["sync"]["source_zone"] not in zones.ZONE_NAMES:
-        out["sync"]["source_zone"] = DEFAULTS["sync"]["source_zone"]
     return out
 
 
