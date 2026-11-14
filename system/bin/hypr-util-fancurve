@@ -1,6 +1,6 @@
 #!/bin/bash
 # Multi-point fan curve daemon, driven by the CPU package sensor (k10temp on
-# AMD, coretemp on Intel), controlling the hp-wmi pwm1 fan.
+# AMD, coretemp on Intel), controlling the hp-wmi fans.
 #
 # The active curve follows power-profiles-daemon's current profile (eco/balanced/
 # performance), however it was changed -- by this app's tray, gnome-control-center,
@@ -83,16 +83,22 @@ fi
 TEMP_INPUT="$CPU_HWMON/temp1_input"
 PWM_OUTPUT="$HP_HWMON/pwm1"
 PWM_ENABLE="$HP_HWMON/pwm1_enable"
+# Older kernels use pwm1 for both fans. Newer hp-wmi drivers expose
+# independent channels, with pwm1_enable still shared by both fans.
+PWM_OUTPUTS=("$PWM_OUTPUT")
+if [ -e "$HP_HWMON/pwm2" ]; then
+	PWM_OUTPUTS+=("$HP_HWMON/pwm2")
+fi
 
 cleanup() {
-	log "stopping, handing pwm1 back to firmware auto mode"
+	log "stopping, handing fans back to firmware auto mode"
 	echo 2 > "$PWM_ENABLE" 2>/dev/null || true
-	exit 0
 }
-trap cleanup TERM INT
+trap cleanup EXIT
+trap 'exit 0' TERM INT
 
 echo 1 > "$PWM_ENABLE"
-log "started, hwmon for fan=$HP_HWMON cpu=$CPU_HWMON"
+log "started, hwmon for fan=$HP_HWMON cpu=$CPU_HWMON, controlling ${#PWM_OUTPUTS[@]} PWM channel(s)"
 
 current_profile() {
 	powerprofilesctl get 2>/dev/null || echo "balanced"
@@ -191,6 +197,8 @@ while true; do
 	fi
 	last_pwm="$pwm"
 
-	echo "$pwm" > "$PWM_OUTPUT"
+	for output in "${PWM_OUTPUTS[@]}"; do
+		echo "$pwm" > "$output"
+	done
 	sleep "$INTERVAL"
 done
